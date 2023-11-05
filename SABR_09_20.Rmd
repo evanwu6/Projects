@@ -1,0 +1,89 @@
+---
+title: "SABR Meeting Code"
+author: "Evan Wu"
+date: "September 20, 2023"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+<br>
+<br>
+
+#### Loading Libraries
+
+```{r Libraries, message = FALSE}
+library(tidyverse)
+library(ranger)
+library(readxl)
+library(knitr)
+
+set.seed(20230920)
+```
+ 
+
+<br>
+
+#### Reading in and cleaning up data
+
+##### *Data is all qualified hitters (502+ PA) for the 2022 season* 
+
+```{r Data, message = FALSE}
+# Reading in ohtani hit data
+hit <- read_csv("ohtani_hit_2023.csv")
+pitch <- read_csv("ohtani_pitch_2023.csv")
+```
+
+```{r Functions, echo = FALSE, warning = FALSE}
+geom_zone <- function(top = 11/3, bottom = 3/2, linecolor = "black"){
+  geom_rect(xmin = -.7083, xmax = .7083, ymin = bottom, ymax = top,
+            alpha = 0, color = linecolor, linewidth = 0.75)
+}
+
+# c(0, 0, -.25, -.5, -.25))
+
+geom_plate <- function(pov = "pitcher"){
+   df <- case_when(
+     pov == "pitcher" ~ 
+       data.frame(x = c(-.7083, .7083, .7083 ,0, -.7083), y = c(0, 0, .25, .5, .25)),
+     pov == "catcher" ~ 
+       data.frame(x = c(-.7083, .7083, .7083 ,0, -.7083), y = c(0, 0, -.25, -.5, -.25))
+   )
+  
+   g <- geom_polygon(data = df, aes(x = x, y = y), fill = "white", color = "black", linewidth = 1.25)
+  g
+}
+```
+
+
+<br>
+
+
+#### Making models with data
+
+```{r Models}
+hit %>% 
+  filter(description == "hit_into_play",
+         pitch_name == "Slider") %>% 
+  ggplot(aes(x = plate_x, y = plate_z)) +
+  geom_zone() +
+  geom_plate(pov = "catcher") +
+  geom_point(aes(color = launch_speed), alpha = 0.6) + 
+  coord_fixed() +
+  labs(color = "Exit Velocity",
+       title = "Shohei Ohtani Batted Balls",
+       subtitle = "2023 Season",
+       caption = "Data from Baseball Savant") +
+  scale_color_gradient(low = "yellow", high = "red") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.ticks.y = element_blank())
+```

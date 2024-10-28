@@ -1,0 +1,2964 @@
+---
+title: "The Art of Sequencing: Utilizing Inter-Pitch Dynamics to Enhance Pitch Evaluation in Major League Baseball"
+author: 
+ - Ethan Park^[Ethan Park, University of Southern California, edpark@usc.edu], Evan Wu^[Evan Wu, Elon University, ewu@elon.edu], Priyanka Kaul^[Priyanka Kaul, Harvard University, pkaul@college.harvard.edu]
+date: "July 28th, 2023"
+header-includes:
+   - \usepackage[default]{sourcesanspro}
+   - \usepackage[T1]{fontenc}
+mainfont: SourceSansPro
+output: 
+  html_document:
+    theme: spacelab
+    highlight: tango
+    toc: true
+    toc_float: true
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r Setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+source("Data.R")
+```
+
+```{r Libraries, message = FALSE, echo = FALSE}
+library(tidyverse)
+library(readxl)
+library(patchwork)
+library(kableExtra)
+library(knitr)
+library(ranger)
+library(vip)
+library(rpart)
+library(rpart.plot)
+library(gridExtra)
+library(caret)
+library(mgcv)
+library(tidymodels)
+
+set.seed(13*38*51)
+```
+
+# Introduction
+
+Over the past few years, Major League Baseball has seen substantial shifts in
+what have traditionally been considered the most dominant pitches. Earlier this year, Mets ace Justin
+Verlander remarked that sliders haven't been performing as
+well as in the past, in fact, OPS on sliders is "the highest it's been in
+the pitch tracking years".^1^ The introduction of the sweeper, an attempt to
+designate differences between two types of sliders, and new
+evaluation metrics such as Stuff+, Location+, and Pitching+, have only added
+dimension to the evaluation of pitch types and are indicative of a
+growing focus on individual pitch characteristics. While the discrete qualities
+of a pitch (such as movement, velocity, and spin rate) are
+undoubtedly useful in evaluating and explaining elite pitchers, the effects that
+sequencing and in-game pitching strategy have on outcomes cannot be understated.
+Therefore, integrating inter-pitch dynamics with discrete pitch characteristics
+might more accurately model a pitcher's effectiveness. Fangraph's Stuff+ metric
+does a satisfactory job in evaluating the efficacy of a pitch based on discrete
+characteristics, but it is limited in that it fails to consider the art of
+pitch sequencing. Our motivation behind this project is to both assess current discrete 
+pitch evaluation metrics and consider how inter-pitch dynamics can enhance existing models. 
+
+# Data
+
+The data for our project was compiled from Fangraphs and Baseball Savant. All of the data used in our research are season statistics separated by year, pitcher, and pitch type from the 2020-2022 seasons where the specified pitch had 250 or more recorded pitches for the given season. The Stuff+ data, both pitcher and pitch specific values, are from Fangraphs. All other data, including movement and pitch metric data (e.g. spin rate, xwOBA, pitches thrown) was collected from Baseball Savant.
+
+## Exploratory Data Analysis (EDA)
+
+##### Note Recategorization: 
+
+##### *"Sliders" includes Slurves and Sweepers*
+
+##### *"Curveballs" includes Knuckle Curves*
+
+##### *"Changeup" includes Splitters*
+
+Our initial exploratory data analysis revolved around understanding pitch characteristics such as movement, velocity and spin. We began by charting some average values by pitch type: vertical and horizontal break, the proportion of time that they're thrown, spin rate in revolutions per minute, and speed. 
+
+<br>
+
+```{r League Movement, warning = FALSE, message = FALSE, echo = FALSE}
+results <- pitches %>% 
+  select(-c(pos3_int_start_distance:pos9_int_start_distance))
+
+movement <- Data %>% 
+  select(pitch_type, pitch_type_name, Stuff, `Stf+ Pitch`:tail, 
+         avg_speed, pitches_thrown, pitch_per, spin_rate, playerID) %>% 
+  rename(pitch_prop = pitch_per) %>% 
+  filter(!is.na(`Stf+ Pitch`))
+
+league <- movement %>% 
+  group_by(pitch_type_name) %>% 
+  summarize("horizontal" = 
+              weighted.mean(pitcher_break_x, pitches_thrown),
+            "vertical" = 
+              weighted.mean(pitcher_break_z, pitches_thrown),
+            "prop" =  
+              weighted.mean(pitch_prop, pitches_thrown),
+            "spin" =  
+              weighted.mean(spin_rate, pitches_thrown, na.rm = TRUE),
+            "speed" =  
+              weighted.mean(avg_speed, pitches_thrown, na.rm = TRUE)) %>% 
+  as.data.frame() %>% 
+  arrange(desc(speed))
+  
+league %>% 
+  kable(digits = 2, align = "c",
+        col.names = c("Pitch", "Horizontal", "Vertical",
+                      "Pitch Proportion", "Spin Rate", "Speed")) %>% 
+  kable_styling(full_width = T)
+```
+
+
+Next, we turned our attention to the popular Stuff+ metric used to evaluate the success of pitches. Stuff+ factors in the discrete characteristics we've explored and more to evaluate pitchers - our question was, do pitchers know what they do well? Can Stuff+ actually predict usage? In doing this, we wanted to see if pitchers "knew" which of their pitches were most effective and threw those pitches in higher proportions. 
+
+
+```{r Pitch Prop, echo = FALSE, warning = FALSE, message = FALSE}
+Data2 %>% 
+  ggplot(aes(x = `Stf+ Pitch`, y = (pitch_per-league$prop)/league$prop,
+             color = woba)) +
+  theme(panel.background = element_rect("black"),
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_line("darkgray")) +
+  geom_hline(yintercept = 0, color = "yellow", size = 1, alpha = 0.7) +
+  geom_vline(xintercept = 100, color = "yellow", size = 1, alpha = 0.7) +
+  geom_point(alpha = 0.8) +
+  geom_smooth(se = FALSE, color = "gray92", size = 1.5) +
+  labs(x = "Pitch Stuff+",
+       y = "Pitch Usage (vs. League Average)",
+       color = "wOBA") +
+  scale_color_gradient(low = "green", high = "red") +
+  scale_y_continuous(limits = c(-1,2.5), labels = scales::percent) +
+  NULL
+
+```
+
+
+Our graph shows that as Stuff+ increases, pitch usage tends to increase as well - indicating that pitchers do in fact throw their best pitches (as determined by Stuff+) more frequently. Our graph is colored by weighted on base percentage (wOBA) to further show that pitches with high Stuff+ ratings are correlated with lower opposing wOBA. 
+
+<center>
+#### **Pitch-by-Pitch Breakdowns:**
+</center>
+
+Next, we wanted to know how each of these discrete characteristics might carry a different level of importance based on the pitch type. Is vertical break more important than speed for curveballs, and if so, how much more important is it? To explore these questions we created variable importance plots for each of our interest variables across all pitch types. Our outcome variables - wOBA, xwOBA, and run value per 100 - were selected because they are tangible result-based metrics that point toward the effectiveness of a pitch. 
+
+## Intra-Pitch Data Analysis
+
+### Variable Importance Plots {.tabset}
+###### Sinkers, Cutters, and Four-Seam Fastballs have been aggregated into a singular "Fastball" category.
+
+#### wOBA {.tabset}
+##### Fastballs
+```{r Fastballs wOBA VIP, echo = FALSE}
+
+fastball_reduced <- Data2 %>% 
+  filter(pitch_type == "FC" | pitch_type == "FF" | pitch_type == "SI") %>% 
+  select(woba, pitcher_break_z, pitcher_break_x, avg_speed, spin_rate, pitch_type) %>% 
+  filter(!is.na(spin_rate))
+
+fastball_model <- ranger(woba ~ ., data = fastball_reduced, num.trees = 1000,
+                      importance = "impurity") 
+
+vip(fastball_model, geom = "point") + 
+  labs(title = "Reduced Model",
+       caption = "Variables: pitcher_break_z, pitcher_break_x, avg_speed, spin_rate") +
+  theme_bw()
+
+```
+
+##### Sliders
+```{r Slider wOBA VIP, echo = FALSE}
+
+slider_reduced <- Data2 %>% 
+  filter(pitch_type == "SL") %>% 
+  select(woba, pitcher_break_z, pitcher_break_x, avg_speed, spin_rate, 
+         speed_diff) %>% 
+  filter(!is.na(spin_rate), !is.na(speed_diff))
+
+slider_model <- ranger(woba ~ ., data = slider_reduced, num.trees = 1000,
+                      importance = "impurity") 
+
+vip(slider_model, geom = "point") + 
+  labs(title = "Reduced Model",
+       caption = "Variables: pitcher_break_z, pitcher_break_x, avg_speed, spin_rate, speed_diff") +
+  theme_bw()
+
+```
+
+##### Curveballs
+```{r Curveballs wOBA VIP, echo = FALSE}
+curveball_reduced <- Data2 %>% 
+  filter(pitch_type == "CU") %>% 
+  select(woba, pitcher_break_z, pitcher_break_x, avg_speed, spin_rate, speed_diff) %>% 
+  filter(!is.na(spin_rate), !is.na(speed_diff))
+
+curveball_model <- ranger(woba ~ ., data = curveball_reduced, num.trees = 1000,
+                      importance = "impurity") 
+
+vip(curveball_model, geom = "point") + 
+  labs(title = "Reduced Model",
+       caption = "Variables: pitcher_break_z, pitcher_break_x, avg_speed, spin_rate, speed_diff") +
+  theme_bw()
+
+```
+
+##### Change-Ups
+```{r Change-Ups wOBA VIP, echo = FALSE}
+changeup_reduced <- Data2 %>% 
+  filter(pitch_type == "CH" | pitch_type == "FS") %>% 
+  select(woba, pitcher_break_z, pitcher_break_x, avg_speed, spin_rate, speed_diff) %>% 
+  filter(!is.na(spin_rate), !is.na(speed_diff))
+
+changeup_model <- ranger(woba ~ ., data = changeup_reduced, num.trees = 1000,
+                      importance = "impurity") 
+
+vip(changeup_model, geom = "point") + 
+  labs(title = "Reduced Model",
+       caption = "Variables: pitcher_break_z, pitcher_break_x, avg_speed, spin_rate, speed_diff") +
+  theme_bw()
+
+```
+
+#### {-}
+
+#### xwOBA {.tabset}
+##### Fastballs
+```{r Fastballs xwOBA VIP, echo = FALSE}
+
+x_fastball_reduced <- Data2 %>% 
+  filter(pitch_type == "FC" | pitch_type == "FF" | pitch_type == "SI") %>% 
+  select(est_woba, pitcher_break_z, pitcher_break_x, avg_speed, spin_rate, pitch_type) %>% 
+  filter(!is.na(spin_rate))
+
+x_fastball_model <- ranger(est_woba ~ ., data = x_fastball_reduced, num.trees = 1000,
+                      importance = "impurity") 
+
+vip(x_fastball_model, geom = "point") + 
+  labs(title = "Reduced Model",
+       caption = "Variables: pitcher_break_z, pitcher_break_x, avg_speed, spin_rate") +
+  theme_bw()
+
+```
+
+##### Sliders
+```{r Slider xwOBA VIP, echo = FALSE}
+
+x_slider_reduced <- Data2 %>% 
+  filter(pitch_type == "SL") %>% 
+  select(est_woba, pitcher_break_z, pitcher_break_x, avg_speed, spin_rate, 
+         speed_diff) %>% 
+  filter(!is.na(spin_rate), !is.na(speed_diff))
+
+x_slider_model <- ranger(est_woba ~ ., data = x_slider_reduced, num.trees = 1000,
+                      importance = "impurity") 
+
+vip(x_slider_model, geom = "point") + 
+  labs(title = "Reduced Model",
+       caption = "Variables: pitcher_break_z, pitcher_break_x, avg_speed, spin_rate, speed_diff") +
+  theme_bw()
+
+```
+
+##### Curveballs
+```{r Curveballs xwOBA VIP, echo = FALSE}
+x_curveball_reduced <- Data2 %>% 
+  filter(pitch_type == "CU") %>% 
+  select(est_woba, pitcher_break_z, pitcher_break_x, avg_speed, spin_rate, speed_diff) %>% 
+  filter(!is.na(spin_rate), !is.na(speed_diff))
+
+x_curveball_model <- ranger(est_woba ~ ., data = x_curveball_reduced, num.trees = 1000,
+                      importance = "impurity") 
+
+vip(x_curveball_model, geom = "point") + 
+  labs(title = "Reduced Model",
+       caption = "Variables: pitcher_break_z, pitcher_break_x, avg_speed, spin_rate, speed_diff") +
+  theme_bw()
+
+```
+
+##### Change-Ups
+```{r Change-Ups xwOBA VIP, echo = FALSE}
+x_changeup_reduced <- Data2 %>% 
+  filter(pitch_type == "CH" | pitch_type == "FS") %>% 
+  select(est_woba, pitcher_break_z, pitcher_break_x, avg_speed, spin_rate, speed_diff) %>% 
+  filter(!is.na(spin_rate), !is.na(speed_diff))
+
+x_changeup_model <- ranger(est_woba ~ ., data = x_changeup_reduced, num.trees = 1000,
+                      importance = "impurity") 
+
+vip(x_changeup_model, geom = "point") + 
+  labs(title = "Reduced Model",
+       caption = "Variables: pitcher_break_z, pitcher_break_x, avg_speed, spin_rate, speed_diff") +
+  theme_bw()
+
+```
+
+#### {-}
+
+#### Run Value / 100 {.tabset}
+##### Fastballs
+```{r Fastballs RV VIP, echo = FALSE}
+
+rv_fastball_reduced <- Data2 %>% 
+  filter(pitch_type == "FC" | pitch_type == "FF" | pitch_type == "SI") %>% 
+  select(rv100, pitcher_break_z, pitcher_break_x, avg_speed, spin_rate, pitch_type) %>% 
+  filter(!is.na(spin_rate))
+
+rv_fastball_model <- ranger(rv100 ~ ., data = rv_fastball_reduced, num.trees = 1000,
+                      importance = "impurity") 
+
+vip(rv_fastball_model, geom = "point") + 
+  labs(title = "Reduced Model",
+       caption = "Variables: pitcher_break_z, pitcher_break_x, avg_speed, spin_rate") +
+  theme_bw()
+
+```
+
+##### Sliders
+```{r Slider RV VIP, echo = FALSE}
+
+rv_slider_reduced <- Data2 %>% 
+  filter(pitch_type == "SL") %>% 
+  select(rv100, pitcher_break_z, pitcher_break_x, avg_speed, spin_rate, 
+         speed_diff) %>% 
+  filter(!is.na(spin_rate), !is.na(speed_diff))
+
+rv_slider_model <- ranger(rv100 ~ ., data = rv_slider_reduced, num.trees = 1000,
+                      importance = "impurity") 
+
+vip(rv_slider_model, geom = "point") + 
+  labs(title = "Reduced Model",
+       caption = "Variables: pitcher_break_z, pitcher_break_x, avg_speed, spin_rate, speed_diff") +
+  theme_bw()
+
+```
+
+##### Curveballs
+```{r Curveballs RV VIP, echo = FALSE}
+rv_curveball_reduced <- Data2 %>% 
+  filter(pitch_type == "CU") %>% 
+  select(rv100, pitcher_break_z, pitcher_break_x, avg_speed, spin_rate, speed_diff) %>% 
+  filter(!is.na(spin_rate), !is.na(speed_diff))
+
+rv_curveball_model <- ranger(rv100 ~ ., data = rv_curveball_reduced, num.trees = 1000,
+                      importance = "impurity") 
+
+vip(rv_curveball_model, geom = "point") + 
+  labs(title = "Reduced Model",
+       caption = "Variables: pitcher_break_z, pitcher_break_x, avg_speed, spin_rate, speed_diff") +
+  theme_bw()
+
+```
+
+##### Change-Ups
+```{r Change-Ups RV VIP, echo = FALSE}
+rv_changeup_reduced <- Data2 %>% 
+  filter(pitch_type == "CH" | pitch_type == "FS") %>% 
+  select(rv100, pitcher_break_z, pitcher_break_x, avg_speed, spin_rate, speed_diff) %>% 
+  filter(!is.na(spin_rate), !is.na(speed_diff))
+
+rv_changeup_model <- ranger(rv100 ~ ., data = rv_changeup_reduced, num.trees = 1000,
+                      importance = "impurity") 
+
+vip(rv_changeup_model, geom = "point") + 
+  labs(title = "Reduced Model",
+       caption = "Variables: pitcher_break_z, pitcher_break_x, avg_speed, spin_rate, speed_diff") +
+  theme_bw()
+
+```
+
+#### {-}
+
+### {-}
+
+
+These importance plots should be considered only within themselves, not across various plots. From these plots, we can see what variables have similar importance levels to each other within a particular pitch type and how variable importance changes based on the pitch and outcome response variable. 
+
+
+### Pitch Characteristics {.tabset}
+
+#### wOBA {.tabset}
+##### Four-Seam
+```{r Four Seams wOBA, warning = FALSE, message = FALSE, echo = FALSE}
+g_ff_1 <- Data2 %>% 
+  filter(pitch_type == "FF") %>% 
+  ggplot(aes(x = spin_rate, y = woba, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7, show.legend = FALSE) +
+  geom_smooth(method = lm, se = FALSE, show.legend = FALSE) + 
+  labs(x = "Spin Rate (rpm)",
+       y = "wOBA",
+       subtitle = "Spin Rate") +
+  scale_color_gradient(low = "red", high = "green") +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_x_continuous(labels = scales::comma) +
+  theme_dark() +
+  theme(plot.subtitle = element_text(hjust = 0.5))
+
+g_ff_2 <- Data2 %>% 
+  filter(pitch_type == "FF") %>% 
+  ggplot(aes(x = avg_speed, y = woba, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = lm, se = FALSE) + 
+  labs(x = "Average Pitch Speed (mph)",
+       y = "",
+       color = "Stuff+",
+       subtitle = "Speed") +
+  scale_y_reverse() +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_color_gradient(low = "red", high = "green") +
+  theme_dark()+
+  theme(plot.subtitle = element_text(hjust = 0.5),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+
+grid.arrange(g_ff_1, g_ff_2, ncol = 2, top = "wOBA on Four-Seam Fastballs by Spin Rate & Speed")
+```
+
+##### Cutters
+```{r Cutters wOBA, warning = FALSE, message = FALSE, echo = FALSE}
+g_fc_1 <- Data2 %>% 
+  filter(pitch_type == "FC") %>% 
+  ggplot(aes(x = spin_rate, y = woba, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7, show.legend = FALSE) +
+  geom_smooth(method = lm, se = FALSE, show.legend = FALSE) + 
+  labs(x = "Spin Rate (rpm)",
+       y = "wOBA",
+       subtitle = "Spin Rate") +
+  scale_color_gradient(low = "red", high = "green") +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_x_continuous(labels = scales::comma) +
+  theme_dark() +
+  theme(plot.subtitle = element_text(hjust = 0.5))
+
+g_fc_2 <- Data2 %>% 
+  filter(pitch_type == "FC") %>% 
+  ggplot(aes(x = avg_speed, y = woba, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = lm, se = FALSE) + 
+  labs(x = "Average Pitch Speed (mph)",
+       y = "",
+       color = "Stuff+",
+       subtitle = "Speed") +
+  scale_y_reverse() +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_color_gradient(low = "red", high = "green") +
+  theme_dark()+
+  theme(plot.subtitle = element_text(hjust = 0.5),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+
+grid.arrange(g_fc_1, g_fc_2, ncol = 2, top = "wOBA on Cutters by Spin Rate & Speed")
+```
+
+##### Sinkers
+```{r Sinkers wOBA, warning = FALSE, message = FALSE, echo = FALSE}
+g_si_1 <- Data2 %>% 
+  filter(pitch_type == "SI") %>% 
+  ggplot(aes(x = spin_rate, y = woba, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7, show.legend = FALSE) +
+  geom_smooth(method = lm, se = FALSE, show.legend = FALSE) + 
+  labs(x = "Spin Rate (rpm)",
+       y = "wOBA",
+       subtitle = "Spin Rate") +
+  scale_color_gradient(low = "red", high = "green") +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_x_continuous(labels = scales::comma) +
+  theme_dark() +
+  theme(plot.subtitle = element_text(hjust = 0.5))
+
+g_si_2 <- Data2 %>% 
+  filter(pitch_type == "SI") %>% 
+  ggplot(aes(x = avg_speed, y = woba, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = lm, se = FALSE) + 
+  labs(x = "Average Pitch Speed (mph)",
+       y = "",
+       color = "Stuff+",
+       subtitle = "Speed") +
+  scale_y_reverse() +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_color_gradient(low = "red", high = "green") +
+  theme_dark()+
+  theme(plot.subtitle = element_text(hjust = 0.5),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+
+grid.arrange(g_si_1, g_si_2, ncol = 2, top = "wOBA on Sinkers by Spin Rate & Speed")
+```
+
+##### Sliders
+```{r Sliders wOBA, warning = FALSE, message = FALSE, echo = FALSE}
+g_sl_1 <- Data2 %>% 
+  filter(pitch_type == "SL") %>% 
+  ggplot(aes(x = spin_rate, y = woba, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7, show.legend = FALSE) +
+  geom_smooth(method = lm, se = FALSE, show.legend = FALSE) + 
+  labs(x = "Spin Rate (rpm)",
+       y = "wOBA",
+       subtitle = "Spin Rate") +
+  scale_color_gradient(low = "red", high = "green") +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_x_continuous(labels = scales::comma) +
+  theme_dark() +
+  theme(plot.subtitle = element_text(hjust = 0.5))
+
+g_sl_2 <- Data2 %>% 
+  filter(pitch_type == "SL") %>% 
+  ggplot(aes(x = avg_speed, y = woba, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = lm, se = FALSE) + 
+  labs(x = "Average Pitch Speed (mph)",
+       y = "",
+       color = "Stuff+",
+       subtitle = "Speed") +
+  scale_y_reverse() +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_color_gradient(low = "red", high = "green") +
+  theme_dark()+
+  theme(plot.subtitle = element_text(hjust = 0.5),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+
+grid.arrange(g_sl_1, g_sl_2, ncol = 2, top = "wOBA on Sliders by Spin Rate & Speed")
+```
+
+##### Curveballs
+```{r Curveballs wOBA, warning = FALSE, message = FALSE, echo = FALSE}
+g_cu_1 <- Data2 %>% 
+  filter(pitch_type == "CU") %>% 
+  ggplot(aes(x = spin_rate, y = woba, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7, show.legend = FALSE) +
+  geom_smooth(method = lm, se = FALSE, show.legend = FALSE) + 
+  labs(x = "Spin Rate (rpm)",
+       y = "wOBA",
+       subtitle = "Spin Rate") +
+  scale_color_gradient(low = "red", high = "green") +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_x_continuous(labels = scales::comma) +
+  theme_dark() +
+  theme(plot.subtitle = element_text(hjust = 0.5))
+
+g_cu_2 <- Data2 %>% 
+  filter(pitch_type == "CU") %>% 
+  ggplot(aes(x = avg_speed, y = woba, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = lm, se = FALSE) + 
+  labs(x = "Average Pitch Speed (mph)",
+       y = "",
+       color = "Stuff+",
+       subtitle = "Speed") +
+  scale_y_reverse() +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_color_gradient(low = "red", high = "green") +
+  theme_dark()+
+  theme(plot.subtitle = element_text(hjust = 0.5),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+
+grid.arrange(g_cu_1, g_cu_2, ncol = 2, top = "wOBA on Curveballs by Spin Rate & Speed")
+```
+
+##### Change-Ups
+```{r Change-Ups wOBA, warning = FALSE, message = FALSE, echo = FALSE}
+g_ch_1 <- Data2 %>% 
+  filter(pitch_type == "CH" | pitch_type == "FS") %>% 
+  ggplot(aes(x = spin_rate, y = woba, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7, show.legend = FALSE) +
+  geom_smooth(method = lm, se = FALSE, show.legend = FALSE) + 
+  labs(x = "Spin Rate (rpm)",
+       y = "wOBA",
+       subtitle = "Spin Rate") +
+  scale_color_gradient(low = "red", high = "green") +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_x_continuous(labels = scales::comma) +
+  theme_dark() +
+  theme(plot.subtitle = element_text(hjust = 0.5))
+
+g_ch_2 <- Data2 %>% 
+  filter(pitch_type == "CH" | pitch_type == "FS") %>% 
+  ggplot(aes(x = avg_speed, y = woba, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = lm, se = FALSE) + 
+  labs(x = "Average Pitch Speed (mph)",
+       y = "",
+       color = "Stuff+",
+       subtitle = "Speed") +
+  scale_y_reverse() +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_color_gradient(low = "red", high = "green") +
+  theme_dark()+
+  theme(plot.subtitle = element_text(hjust = 0.5),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+
+grid.arrange(g_ch_1, g_ch_2, ncol = 2, top = "wOBA on Change-Ups by Spin Rate & Speed")
+```
+
+#### {-}
+
+#### xwOBA {.tabset}
+##### Four-Seam
+```{r Four Seams xwOBA, warning = FALSE, message = FALSE, echo = FALSE}
+gx_ff_1 <- Data2 %>% 
+  filter(pitch_type == "FF") %>% 
+  ggplot(aes(x = spin_rate, y = est_woba, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7, show.legend = FALSE) +
+  geom_smooth(method = lm, se = FALSE, show.legend = FALSE) + 
+  labs(x = "Spin Rate (rpm)",
+       y = "xwOBA",
+       subtitle = "Spin Rate") +
+  scale_color_gradient(low = "red", high = "green") +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_x_continuous(labels = scales::comma) +
+  theme_dark() +
+  theme(plot.subtitle = element_text(hjust = 0.5))
+
+gx_ff_2 <- Data2 %>% 
+  filter(pitch_type == "FF") %>% 
+  ggplot(aes(x = avg_speed, y = est_woba, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = lm, se = FALSE) + 
+  labs(x = "Average Pitch Speed (mph)",
+       y = "",
+       color = "Stuff+",
+       subtitle = "Speed") +
+  scale_y_reverse() +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_color_gradient(low = "red", high = "green") +
+  theme_dark()+
+  theme(plot.subtitle = element_text(hjust = 0.5),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+
+grid.arrange(gx_ff_1, gx_ff_2, ncol = 2, top = "xwOBA on Four-Seam Fastballs by Spin Rate & Speed")
+```
+
+##### Cutters
+```{r Cutters xwOBA, warning = FALSE, message = FALSE, echo = FALSE}
+gx_fc_1 <- Data2 %>% 
+  filter(pitch_type == "FC") %>% 
+  ggplot(aes(x = spin_rate, y = est_woba, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7, show.legend = FALSE) +
+  geom_smooth(method = lm, se = FALSE, show.legend = FALSE) + 
+  labs(x = "Spin Rate (rpm)",
+       y = "xwOBA",
+       subtitle = "Spin Rate") +
+  scale_color_gradient(low = "red", high = "green") +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_x_continuous(labels = scales::comma) +
+  theme_dark() +
+  theme(plot.subtitle = element_text(hjust = 0.5))
+
+gx_fc_2 <- Data2 %>% 
+  filter(pitch_type == "FC") %>% 
+  ggplot(aes(x = avg_speed, y = est_woba, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = lm, se = FALSE) + 
+  labs(x = "Average Pitch Speed (mph)",
+       y = "",
+       color = "Stuff+",
+       subtitle = "Speed") +
+  scale_y_reverse() +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_color_gradient(low = "red", high = "green") +
+  theme_dark()+
+  theme(plot.subtitle = element_text(hjust = 0.5),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+
+grid.arrange(gx_fc_1, gx_fc_2, ncol = 2, top = "xwOBA on Cutters by Spin Rate & Speed")
+```
+
+##### Sinkers
+```{r Sinkers xwOBA, warning = FALSE, message = FALSE, echo = FALSE}
+gx_si_1 <- Data2 %>% 
+  filter(pitch_type == "SI") %>% 
+  ggplot(aes(x = spin_rate, y = est_woba, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7, show.legend = FALSE) +
+  geom_smooth(method = lm, se = FALSE, show.legend = FALSE) + 
+  labs(x = "Spin Rate (rpm)",
+       y = "xwOBA",
+       subtitle = "Spin Rate") +
+  scale_color_gradient(low = "red", high = "green") +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_x_continuous(labels = scales::comma) +
+  theme_dark() +
+  theme(plot.subtitle = element_text(hjust = 0.5))
+
+gx_si_2 <- Data2 %>% 
+  filter(pitch_type == "SI") %>% 
+  ggplot(aes(x = avg_speed, y = est_woba, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = lm, se = FALSE) + 
+  labs(x = "Average Pitch Speed (mph)",
+       y = "",
+       color = "Stuff+",
+       subtitle = "Speed") +
+  scale_y_reverse() +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_color_gradient(low = "red", high = "green") +
+  theme_dark()+
+  theme(plot.subtitle = element_text(hjust = 0.5),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+
+grid.arrange(gx_si_1, gx_si_2, ncol = 2, top = "xwOBA on Sinkers by Spin Rate & Speed")
+```
+
+##### Sliders
+```{r Sliders xwOBA, warning = FALSE, message = FALSE, echo = FALSE}
+gx_sl_1 <- Data2 %>% 
+  filter(pitch_type == "SL") %>% 
+  ggplot(aes(x = spin_rate, y = est_woba, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7, show.legend = FALSE) +
+  geom_smooth(method = lm, se = FALSE, show.legend = FALSE) + 
+  labs(x = "Spin Rate (rpm)",
+       y = "xwOBA",
+       subtitle = "Spin Rate") +
+  scale_color_gradient(low = "red", high = "green") +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_x_continuous(labels = scales::comma) +
+  theme_dark() +
+  theme(plot.subtitle = element_text(hjust = 0.5))
+
+gx_sl_2 <- Data2 %>% 
+  filter(pitch_type == "SL") %>% 
+  ggplot(aes(x = avg_speed, y = est_woba, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = lm, se = FALSE) + 
+  labs(x = "Average Pitch Speed (mph)",
+       y = "",
+       color = "Stuff+",
+       subtitle = "Speed") +
+  scale_y_reverse() +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_color_gradient(low = "red", high = "green") +
+  theme_dark()+
+  theme(plot.subtitle = element_text(hjust = 0.5),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+
+grid.arrange(gx_sl_1, gx_sl_2, ncol = 2, top = "xwOBA on Sliders by Spin Rate & Speed")
+```
+
+##### Curveballs
+```{r Curveballs xwOBA, warning = FALSE, message = FALSE, echo = FALSE}
+gx_cu_1 <- Data2 %>% 
+  filter(pitch_type == "CU") %>% 
+  ggplot(aes(x = spin_rate, y = est_woba, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7, show.legend = FALSE) +
+  geom_smooth(method = lm, se = FALSE, show.legend = FALSE) + 
+  labs(x = "Spin Rate (rpm)",
+       y = "xwOBA",
+       subtitle = "Spin Rate") +
+  scale_color_gradient(low = "red", high = "green") +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_x_continuous(labels = scales::comma) +
+  theme_dark() +
+  theme(plot.subtitle = element_text(hjust = 0.5))
+
+gx_cu_2 <- Data2 %>% 
+  filter(pitch_type == "CU") %>% 
+  ggplot(aes(x = avg_speed, y = est_woba, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = lm, se = FALSE) + 
+  labs(x = "Average Pitch Speed (mph)",
+       y = "",
+       color = "Stuff+",
+       subtitle = "Speed") +
+  scale_y_reverse() +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_color_gradient(low = "red", high = "green") +
+  theme_dark()+
+  theme(plot.subtitle = element_text(hjust = 0.5),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+
+grid.arrange(gx_cu_1, gx_cu_2, ncol = 2, top = "xwOBA on Curveballs by Spin Rate & Speed")
+```
+
+##### Change-Ups
+```{r Change-Ups xwOBA, warning = FALSE, message = FALSE, echo = FALSE}
+gx_ch_1 <- Data2 %>% 
+  filter(pitch_type == "CH" | pitch_type == "FS") %>% 
+  ggplot(aes(x = spin_rate, y = est_woba, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7, show.legend = FALSE) +
+  geom_smooth(method = lm, se = FALSE, show.legend = FALSE) + 
+  labs(x = "Spin Rate (rpm)",
+       y = "xwOBA",
+       subtitle = "Spin Rate") +
+  scale_color_gradient(low = "red", high = "green") +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_x_continuous(labels = scales::comma) +
+  theme_dark() +
+  theme(plot.subtitle = element_text(hjust = 0.5))
+
+gx_ch_2 <- Data2 %>% 
+  filter(pitch_type == "CH" | pitch_type == "FS") %>% 
+  ggplot(aes(x = avg_speed, y = est_woba, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = lm, se = FALSE) + 
+  labs(x = "Average Pitch Speed (mph)",
+       y = "",
+       color = "Stuff+",
+       subtitle = "Speed") +
+  scale_y_reverse() +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_color_gradient(low = "red", high = "green") +
+  theme_dark()+
+  theme(plot.subtitle = element_text(hjust = 0.5),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+
+grid.arrange(gx_ch_1, gx_ch_2, ncol = 2, top = "xwOBA on Change-Ups by Spin Rate & Speed")
+```
+
+#### {-}
+
+#### Run Value / 100 {.tabset}
+##### Four-Seam
+```{r Four Seams RV, warning = FALSE, message = FALSE, echo = FALSE}
+grv_ff_1 <- Data2 %>% 
+  filter(pitch_type == "FF") %>% 
+  ggplot(aes(x = spin_rate, y = rv100, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7, show.legend = FALSE) +
+  geom_smooth(method = lm, se = FALSE, show.legend = FALSE) + 
+  labs(x = "Spin Rate (rpm)",
+       y = "Run Value / 100",
+       subtitle = "Spin Rate") +
+  scale_color_gradient(low = "red", high = "green") +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_x_continuous(labels = scales::comma) +
+  theme_dark() +
+  theme(plot.subtitle = element_text(hjust = 0.5))
+
+grv_ff_2 <- Data2 %>% 
+  filter(pitch_type == "FF") %>% 
+  ggplot(aes(x = avg_speed, y = rv100, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = lm, se = FALSE) + 
+  labs(x = "Average Pitch Speed (mph)",
+       y = "",
+       color = "Stuff+",
+       subtitle = "Speed") +
+  scale_y_reverse() +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_color_gradient(low = "red", high = "green") +
+  theme_dark()+
+  theme(plot.subtitle = element_text(hjust = 0.5),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+
+grid.arrange(grv_ff_1, grv_ff_2, ncol = 2, top = "Run Value on Four-Seam Fastballs by Spin Rate & Speed")
+```
+
+##### Cutters
+```{r Cutters RV, warning = FALSE, message = FALSE, echo = FALSE}
+grv_fc_1 <- Data2 %>% 
+  filter(pitch_type == "FC") %>% 
+  ggplot(aes(x = spin_rate, y = rv100, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7, show.legend = FALSE) +
+  geom_smooth(method = lm, se = FALSE, show.legend = FALSE) + 
+  labs(x = "Spin Rate (rpm)",
+       y = "Run Value / 100",
+       subtitle = "Spin Rate") +
+  scale_color_gradient(low = "red", high = "green") +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_x_continuous(labels = scales::comma) +
+  theme_dark() +
+  theme(plot.subtitle = element_text(hjust = 0.5))
+
+grv_fc_2 <- Data2 %>% 
+  filter(pitch_type == "FC") %>% 
+  ggplot(aes(x = avg_speed, y = rv100, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = lm, se = FALSE) + 
+  labs(x = "Average Pitch Speed (mph)",
+       y = "",
+       color = "Stuff+",
+       subtitle = "Speed") +
+  scale_y_reverse() +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_color_gradient(low = "red", high = "green") +
+  theme_dark()+
+  theme(plot.subtitle = element_text(hjust = 0.5),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+
+grid.arrange(grv_fc_1, grv_fc_2, ncol = 2, top = "Run Value on Cutters by Spin Rate & Speed")
+```
+
+##### Sinkers
+```{r Sinkers RV, warning = FALSE, message = FALSE, echo = FALSE}
+grv_si_1 <- Data2 %>% 
+  filter(pitch_type == "SI") %>% 
+  ggplot(aes(x = spin_rate, y = rv100, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7, show.legend = FALSE) +
+  geom_smooth(method = lm, se = FALSE, show.legend = FALSE) + 
+  labs(x = "Spin Rate (rpm)",
+       y = "Run Value / 100",
+       subtitle = "Spin Rate") +
+  scale_color_gradient(low = "red", high = "green") +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_x_continuous(labels = scales::comma) +
+  theme_dark() +
+  theme(plot.subtitle = element_text(hjust = 0.5))
+
+grv_si_2 <- Data2 %>% 
+  filter(pitch_type == "SI") %>% 
+  ggplot(aes(x = avg_speed, y = rv100, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = lm, se = FALSE) + 
+  labs(x = "Average Pitch Speed (mph)",
+       y = "",
+       color = "Stuff+",
+       subtitle = "Speed") +
+  scale_y_reverse() +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_color_gradient(low = "red", high = "green") +
+  theme_dark()+
+  theme(plot.subtitle = element_text(hjust = 0.5),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+
+grid.arrange(grv_si_1, grv_si_2, ncol = 2, top = "Run Value on Sinkers by Spin Rate & Speed")
+```
+
+##### Sliders
+```{r Sliders RV, warning = FALSE, message = FALSE, echo = FALSE}
+grv_sl_1 <- Data2 %>% 
+  filter(pitch_type == "SL") %>% 
+  ggplot(aes(x = spin_rate, y = rv100, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7, show.legend = FALSE) +
+  geom_smooth(method = lm, se = FALSE, show.legend = FALSE) + 
+  labs(x = "Spin Rate (rpm)",
+       y = "Run Value / 100",
+       subtitle = "Spin Rate") +
+  scale_color_gradient(low = "red", high = "green") +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_x_continuous(labels = scales::comma) +
+  theme_dark() +
+  theme(plot.subtitle = element_text(hjust = 0.5))
+
+grv_sl_2 <- Data2 %>% 
+  filter(pitch_type == "SL") %>% 
+  ggplot(aes(x = avg_speed, y = rv100, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = lm, se = FALSE) + 
+  labs(x = "Average Pitch Speed (mph)",
+       y = "",
+       color = "Stuff+",
+       subtitle = "Speed") +
+  scale_y_reverse() +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_color_gradient(low = "red", high = "green") +
+  theme_dark()+
+  theme(plot.subtitle = element_text(hjust = 0.5),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+
+grid.arrange(grv_sl_1, grv_sl_2, ncol = 2, top = "Run Value on Sliders by Spin Rate & Speed")
+```
+
+##### Curveballs
+```{r Curveballs RV, warning = FALSE, message = FALSE, echo = FALSE}
+grv_cu_1 <- Data2 %>% 
+  filter(pitch_type == "CU") %>% 
+  ggplot(aes(x = spin_rate, y = rv100, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7, show.legend = FALSE) +
+  geom_smooth(method = lm, se = FALSE, show.legend = FALSE) + 
+  labs(x = "Spin Rate (rpm)",
+       y = "Run Value / 100",
+       subtitle = "Spin Rate") +
+  scale_color_gradient(low = "red", high = "green") +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_x_continuous(labels = scales::comma) +
+  theme_dark() +
+  theme(plot.subtitle = element_text(hjust = 0.5))
+
+grv_cu_2 <- Data2 %>% 
+  filter(pitch_type == "CU") %>% 
+  ggplot(aes(x = avg_speed, y = rv100, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = lm, se = FALSE) + 
+  labs(x = "Average Pitch Speed (mph)",
+       y = "",
+       color = "Stuff+",
+       subtitle = "Speed") +
+  scale_y_reverse() +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_color_gradient(low = "red", high = "green") +
+  theme_dark()+
+  theme(plot.subtitle = element_text(hjust = 0.5),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+
+grid.arrange(grv_cu_1, grv_cu_2, ncol = 2, top = "Run Value on Curveballs by Spin Rate & Speed")
+```
+
+##### Change-Ups
+```{r Change-Ups RV, warning = FALSE, message = FALSE, echo = FALSE}
+grv_ch_1 <- Data2 %>% 
+  filter(pitch_type == "CH" | pitch_type == "FS") %>% 
+  ggplot(aes(x = spin_rate, y = rv100, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7, show.legend = FALSE) +
+  geom_smooth(method = lm, se = FALSE, show.legend = FALSE) + 
+  labs(x = "Spin Rate (rpm)",
+       y = "Run Value / 100",
+       subtitle = "Spin Rate") +
+  scale_color_gradient(low = "red", high = "green") +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_x_continuous(labels = scales::comma) +
+  theme_dark() +
+  theme(plot.subtitle = element_text(hjust = 0.5))
+
+grv_ch_2 <- Data2 %>% 
+  filter(pitch_type == "CH" | pitch_type == "FS") %>% 
+  ggplot(aes(x = avg_speed, y = rv100, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = lm, se = FALSE) + 
+  labs(x = "Average Pitch Speed (mph)",
+       y = "",
+       color = "Stuff+",
+       subtitle = "Speed") +
+  scale_y_reverse() +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_color_gradient(low = "red", high = "green") +
+  theme_dark()+
+  theme(plot.subtitle = element_text(hjust = 0.5),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+
+grid.arrange(grv_ch_1, grv_ch_2, ncol = 2, top = "Run Value on Change-Ups by Spin Rate & Speed")
+```
+
+#### {-}
+
+### {-}
+
+These scatter plots build upon our variable importance plots: they actually show the relationships between our four discrete pitch characteristics and our outcome variables by pitch type. These plots inform our overarching interest in the relationship between intra-pitch characteristics and effectiveness. It's important to note too that the y-axes on these plots are inverted to show that a lower xwOBA is "better" for pitchers. These plots show significant correlations between discrete pitch characteristics and outcome as measuerd through wOBA, xwOBA, and run value per 100. 
+
+### Pitch Movement {.tabset}
+
+#### wOBA {.tabset}
+##### Four-Seam
+```{r Four Seams M wOBA, warning = FALSE, message = FALSE, echo = FALSE}
+g2_ff_1 <- Data2 %>% 
+  filter(pitch_type == "FF") %>% 
+  ggplot(aes(x = pitcher_break_x, y = woba, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7, show.legend = FALSE) +
+  geom_smooth(method = lm, se = FALSE, show.legend = FALSE) + 
+  labs(x = "Horizontal Movement (in.)",
+       y = "wOBA") +
+  scale_color_gradient(low = "red", high = "green") +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  theme_dark() +
+  theme(plot.subtitle = element_text(hjust = 0.5))
+
+g2_ff_2 <- Data2 %>% 
+  filter(pitch_type == "FF") %>% 
+  ggplot(aes(x = pitcher_break_z, y = woba, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = lm, se = FALSE) + 
+  labs(x = "Vertical Movement (in.)",
+       y = "",
+       color = "Stuff+") +
+  scale_y_reverse() +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_color_gradient(low = "red", high = "green") +
+  theme_dark()+
+  theme(plot.subtitle = element_text(hjust = 0.5),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+
+grid.arrange(g2_ff_1, g2_ff_2, ncol = 2, top = "wOBA on Four Seam Fastballs by Pitch Movement")
+```
+
+##### Cutters
+```{r Cutters M wOBA, warning = FALSE, message = FALSE, echo = FALSE}
+g2_fc_1 <- Data2 %>% 
+  filter(pitch_type == "FC") %>% 
+  ggplot(aes(x = pitcher_break_x, y = woba, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7, show.legend = FALSE) +
+  geom_smooth(method = lm, se = FALSE, show.legend = FALSE) + 
+  labs(x = "Horizontal Movement (in.)",
+       y = "wOBA") +
+  scale_color_gradient(low = "red", high = "green") +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  theme_dark() +
+  theme(plot.subtitle = element_text(hjust = 0.5))
+
+g2_fc_2 <- Data2 %>% 
+  filter(pitch_type == "FC") %>% 
+  ggplot(aes(x = pitcher_break_z, y = woba, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = lm, se = FALSE) + 
+  labs(x = "Vertical Movement (in.)",
+       y = "",
+       color = "Stuff+") +
+  scale_y_reverse() +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_color_gradient(low = "red", high = "green") +
+  theme_dark()+
+  theme(plot.subtitle = element_text(hjust = 0.5),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+
+grid.arrange(g2_fc_1, g2_fc_2, ncol = 2, top = "wOBA on Cutters by Pitch Movement")
+```
+
+##### Sinkers
+```{r Sinkers M wOBA, warning = FALSE, message = FALSE, echo = FALSE}
+g2_si_1 <- Data2 %>% 
+  filter(pitch_type == "SI") %>% 
+  ggplot(aes(x = pitcher_break_x, y = woba, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7, show.legend = FALSE) +
+  geom_smooth(method = lm, se = FALSE, show.legend = FALSE) + 
+  labs(x = "Horizontal Movement (in.)",
+       y = "wOBA") +
+  scale_color_gradient(low = "red", high = "green") +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  theme_dark() +
+  theme(plot.subtitle = element_text(hjust = 0.5))
+
+g2_si_2 <- Data2 %>% 
+  filter(pitch_type == "SI") %>% 
+  ggplot(aes(x = pitcher_break_z, y = woba, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = lm, se = FALSE) + 
+  labs(x = "Vertical Movement (in.)",
+       y = "",
+       color = "Stuff+") +
+  scale_y_reverse() +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_color_gradient(low = "red", high = "green") +
+  theme_dark()+
+  theme(plot.subtitle = element_text(hjust = 0.5),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+
+grid.arrange(g2_fc_1, g2_fc_2, ncol = 2, top = "wOBA on Sinkers by Pitch Movement")
+```
+
+##### Sliders
+```{r Sliders M wOBA, warning = FALSE, message = FALSE, echo = FALSE}
+g2_sl_1 <- Data2 %>% 
+  filter(pitch_type == "SL") %>% 
+  ggplot(aes(x = pitcher_break_x, y = woba, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7, show.legend = FALSE) +
+  geom_smooth(method = lm, se = FALSE, show.legend = FALSE) + 
+  labs(x = "Horizontal Movement (in.)",
+       y = "wOBA") +
+  scale_color_gradient(low = "red", high = "green") +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  theme_dark() +
+  theme(plot.subtitle = element_text(hjust = 0.5))
+
+g2_sl_2 <- Data2 %>% 
+  filter(pitch_type == "SL") %>% 
+  ggplot(aes(x = pitcher_break_z, y = woba, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = lm, se = FALSE) + 
+  labs(x = "Vertical Movement (in.)",
+       y = "",
+       color = "Stuff+") +
+  scale_y_reverse() +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_color_gradient(low = "red", high = "green") +
+  theme_dark()+
+  theme(plot.subtitle = element_text(hjust = 0.5),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+
+grid.arrange(g2_sl_1, g2_sl_2, ncol = 2, top = "wOBA on Sliders by Pitch Movement")
+```
+
+##### Curveballs
+```{r Curveballs M wOBA, warning = FALSE, message = FALSE, echo = FALSE}
+g2_cu_1 <- Data2 %>% 
+  filter(pitch_type == "CU") %>% 
+  ggplot(aes(x = pitcher_break_x, y = woba, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7, show.legend = FALSE) +
+  geom_smooth(method = lm, se = FALSE, show.legend = FALSE) + 
+  labs(x = "Horizontal Movement (in.)",
+       y = "wOBA") +
+  scale_color_gradient(low = "red", high = "green") +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  theme_dark() +
+  theme(plot.subtitle = element_text(hjust = 0.5))
+
+g2_cu_2 <- Data2 %>% 
+  filter(pitch_type == "CU") %>% 
+  ggplot(aes(x = pitcher_break_z, y = woba, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = lm, se = FALSE) + 
+  labs(x = "Vertical Movement (in.)",
+       y = "",
+       color = "Stuff+") +
+  scale_y_reverse() +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_color_gradient(low = "red", high = "green") +
+  theme_dark()+
+  theme(plot.subtitle = element_text(hjust = 0.5),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+
+grid.arrange(g2_cu_1, g2_cu_2, ncol = 2, top = "wOBA on Curveballs by Pitch Movement")
+```
+
+##### Change-Ups
+```{r Change-Ups M wOBA, warning = FALSE, message = FALSE, echo = FALSE}
+g2_ch_1 <- Data2 %>% 
+  filter(pitch_type == "CH" | pitch_type == "FS") %>% 
+  ggplot(aes(x = pitcher_break_x, y = woba, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7, show.legend = FALSE, aes(shape = pitch_type_name), size = 2) +
+  geom_smooth(method = lm, se = FALSE, show.legend = FALSE) + 
+  labs(x = "Horizontal Movement (in.)",
+       y = "Run Value / 100",
+       shape = "Pitch Type") +
+  scale_color_gradient(low = "red", high = "green") +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_shape_manual(values = c(20, 18)) +
+  theme_dark() +
+  theme(plot.subtitle = element_text(hjust = 0.5))
+
+g2_ch_2 <- Data2 %>% 
+  filter(pitch_type == "CH" | pitch_type == "FS") %>% 
+  ggplot(aes(x = pitcher_break_z, y = woba, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7, aes(shape = pitch_type_name), size = 2) +
+  geom_smooth(method = lm, se = FALSE) + 
+  labs(x = "Vertical Movement (in.)",
+       y = "",
+       color = "Stuff+",
+       shape = "Pitch Type") +
+  scale_y_reverse() +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_shape_manual(values = c(20, 18)) +
+  scale_color_gradient(low = "red", high = "green") +
+  theme_dark()+
+  theme(plot.subtitle = element_text(hjust = 0.5),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        legend.key = element_rect(fill = NA))
+
+grid.arrange(g2_ch_1, g2_ch_2, ncol = 2, top = "wOBA on Change-Ups by Pitch Movement")
+```
+
+#### {-}
+
+#### xwOBA {.tabset}
+##### Four-Seam
+```{r Four Seams M xwOBA, warning = FALSE, message = FALSE, echo = FALSE}
+gx2_ff_1 <- Data2 %>% 
+  filter(pitch_type == "FF") %>% 
+  ggplot(aes(x = pitcher_break_x, y = est_woba, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7, show.legend = FALSE) +
+  geom_smooth(method = lm, se = FALSE, show.legend = FALSE) + 
+  labs(x = "Horizontal Movement (in.)",
+       y = "xwOBA") +
+  scale_color_gradient(low = "red", high = "green") +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  theme_dark() +
+  theme(plot.subtitle = element_text(hjust = 0.5))
+
+gx2_ff_2 <- Data2 %>% 
+  filter(pitch_type == "FF") %>% 
+  ggplot(aes(x = pitcher_break_z, y = est_woba, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = lm, se = FALSE) + 
+  labs(x = "Vertical Movement (in.)",
+       y = "",
+       color = "Stuff+") +
+  scale_y_reverse() +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_color_gradient(low = "red", high = "green") +
+  theme_dark()+
+  theme(plot.subtitle = element_text(hjust = 0.5),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+
+grid.arrange(gx2_ff_1, gx2_ff_2, ncol = 2, top = "xwOBA on Four Seam Fastballs by Pitch Movement")
+```
+
+##### Cutters
+```{r Cutters M xwOBA, warning = FALSE, message = FALSE, echo = FALSE}
+gx2_fc_1 <- Data2 %>% 
+  filter(pitch_type == "FC") %>% 
+  ggplot(aes(x = pitcher_break_x, y = est_woba, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7, show.legend = FALSE) +
+  geom_smooth(method = lm, se = FALSE, show.legend = FALSE) + 
+  labs(x = "Horizontal Movement (in.)",
+       y = "xwOBA") +
+  scale_color_gradient(low = "red", high = "green") +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  theme_dark() +
+  theme(plot.subtitle = element_text(hjust = 0.5))
+
+gx2_fc_2 <- Data2 %>% 
+  filter(pitch_type == "FC") %>% 
+  ggplot(aes(x = pitcher_break_z, y = est_woba, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = lm, se = FALSE) + 
+  labs(x = "Vertical Movement (in.)",
+       y = "",
+       color = "Stuff+") +
+  scale_y_reverse() +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_color_gradient(low = "red", high = "green") +
+  theme_dark()+
+  theme(plot.subtitle = element_text(hjust = 0.5),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+
+grid.arrange(gx2_fc_1, gx2_fc_2, ncol = 2, top = "xwOBA on Cutters by Pitch Movement")
+```
+
+##### Sinkers
+```{r Sinkers M xwOBA, warning = FALSE, message = FALSE, echo = FALSE}
+gx2_si_1 <- Data2 %>% 
+  filter(pitch_type == "SI") %>% 
+  ggplot(aes(x = pitcher_break_x, y = est_woba, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7, show.legend = FALSE) +
+  geom_smooth(method = lm, se = FALSE, show.legend = FALSE) + 
+  labs(x = "Horizontal Movement (in.)",
+       y = "xwOBA") +
+  scale_color_gradient(low = "red", high = "green") +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  theme_dark() +
+  theme(plot.subtitle = element_text(hjust = 0.5))
+
+gx2_si_2 <- Data2 %>% 
+  filter(pitch_type == "SI") %>% 
+  ggplot(aes(x = pitcher_break_z, y = est_woba, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = lm, se = FALSE) + 
+  labs(x = "Vertical Movement (in.)",
+       y = "",
+       color = "Stuff+") +
+  scale_y_reverse() +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_color_gradient(low = "red", high = "green") +
+  theme_dark()+
+  theme(plot.subtitle = element_text(hjust = 0.5),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+
+grid.arrange(gx2_si_1, gx2_si_2, ncol = 2, top = "xwOBA on Sinkers by Pitch Movement")
+```
+
+##### Sliders
+```{r Sliders M xwOBA, warning = FALSE, message = FALSE, echo = FALSE}
+gx2_sl_1 <- Data2 %>% 
+  filter(pitch_type == "SL") %>% 
+  ggplot(aes(x = pitcher_break_x, y = est_woba, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7, show.legend = FALSE) +
+  geom_smooth(method = lm, se = FALSE, show.legend = FALSE) + 
+  labs(x = "Horizontal Movement (in.)",
+       y = "xwOBA") +
+  scale_color_gradient(low = "red", high = "green") +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  theme_dark() +
+  theme(plot.subtitle = element_text(hjust = 0.5))
+
+gx2_sl_2 <- Data2 %>% 
+  filter(pitch_type == "SL") %>% 
+  ggplot(aes(x = pitcher_break_z, y = est_woba, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = lm, se = FALSE) + 
+  labs(x = "Vertical Movement (in.)",
+       y = "",
+       color = "Stuff+") +
+  scale_y_reverse() +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_color_gradient(low = "red", high = "green") +
+  theme_dark()+
+  theme(plot.subtitle = element_text(hjust = 0.5),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+
+grid.arrange(gx2_sl_1, gx2_sl_2, ncol = 2, top = "xwOBA on Sliders by Pitch Movement")
+```
+
+##### Curveballs
+```{r Curveballs M xwOBA, warning = FALSE, message = FALSE, echo = FALSE}
+gx2_cu_1 <- Data2 %>% 
+  filter(pitch_type == "CU") %>% 
+  ggplot(aes(x = pitcher_break_x, y = est_woba, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7, show.legend = FALSE) +
+  geom_smooth(method = lm, se = FALSE, show.legend = FALSE) + 
+  labs(x = "Horizontal Movement (in.)",
+       y = "xwOBA") +
+  scale_color_gradient(low = "red", high = "green") +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  theme_dark() +
+  theme(plot.subtitle = element_text(hjust = 0.5))
+
+gx2_cu_2 <- Data2 %>% 
+  filter(pitch_type == "CU") %>% 
+  ggplot(aes(x = pitcher_break_z, y = est_woba, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = lm, se = FALSE) + 
+  labs(x = "Vertical Movement (in.)",
+       y = "",
+       color = "Stuff+") +
+  scale_y_reverse() +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_color_gradient(low = "red", high = "green") +
+  theme_dark()+
+  theme(plot.subtitle = element_text(hjust = 0.5),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+
+grid.arrange(gx2_cu_1, gx2_cu_2, ncol = 2, top = "xwOBA on Curveballs by Pitch Movement")
+```
+
+##### Change-Ups
+```{r Change-Ups M xwOBA, warning = FALSE, message = FALSE, echo = FALSE}
+gx2_ch_1 <- Data2 %>% 
+  filter(pitch_type == "CH" | pitch_type == "FS") %>% 
+  ggplot(aes(x = pitcher_break_x, y = est_woba, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7, show.legend = FALSE, aes(shape = pitch_type_name), size = 2) +
+  geom_smooth(method = lm, se = FALSE, show.legend = FALSE) + 
+  labs(x = "Horizontal Movement (in.)",
+       y = "Run Value / 100",
+       shape = "Pitch Type") +
+  scale_color_gradient(low = "red", high = "green") +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_shape_manual(values = c(20, 18)) +
+  theme_dark() +
+  theme(plot.subtitle = element_text(hjust = 0.5))
+
+gx2_ch_2 <- Data2 %>% 
+  filter(pitch_type == "CH" | pitch_type == "FS") %>% 
+  ggplot(aes(x = pitcher_break_z, y = est_woba, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7, aes(shape = pitch_type_name), size = 2) +
+  geom_smooth(method = lm, se = FALSE) + 
+  labs(x = "Vertical Movement (in.)",
+       y = "",
+       color = "Stuff+",
+       shape = "Pitch Type") +
+  scale_y_reverse() +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_shape_manual(values = c(20, 18)) +
+  scale_color_gradient(low = "red", high = "green") +
+  theme_dark()+
+  theme(plot.subtitle = element_text(hjust = 0.5),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        legend.key = element_rect(fill = NA))
+
+grid.arrange(gx2_ch_1, gx2_ch_2, ncol = 2, top = "xwOBA on Change-Ups by Pitch Movement")
+```
+
+#### {-}
+
+#### Run Value / 100 {.tabset}
+##### Four-Seam
+```{r Four Seams M RV, warning = FALSE, message = FALSE, echo = FALSE}
+grv2_ff_1 <- Data2 %>% 
+  filter(pitch_type == "FF") %>% 
+  ggplot(aes(x = pitcher_break_x, y = rv100, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7, show.legend = FALSE) +
+  geom_smooth(method = lm, se = FALSE, show.legend = FALSE) + 
+  labs(x = "Horizontal Movement (in.)",
+       y = "Run Value / 100") +
+  scale_color_gradient(low = "red", high = "green") +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  theme_dark() +
+  theme(plot.subtitle = element_text(hjust = 0.5))
+
+grv2_ff_2 <- Data2 %>% 
+  filter(pitch_type == "FF") %>% 
+  ggplot(aes(x = pitcher_break_z, y = rv100, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = lm, se = FALSE) + 
+  labs(x = "Vertical Movement (in.)",
+       y = "",
+       color = "Stuff+") +
+  scale_y_reverse() +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_color_gradient(low = "red", high = "green") +
+  theme_dark()+
+  theme(plot.subtitle = element_text(hjust = 0.5),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+
+grid.arrange(grv2_ff_1, grv2_ff_2, ncol = 2, top = "Run Value on Four Seam Fastballs by Pitch Movement")
+```
+
+##### Cutters
+```{r Cutters M RV, warning = FALSE, message = FALSE, echo = FALSE}
+grv2_fc_1 <- Data2 %>% 
+  filter(pitch_type == "FC") %>% 
+  ggplot(aes(x = pitcher_break_x, y = rv100, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7, show.legend = FALSE) +
+  geom_smooth(method = lm, se = FALSE, show.legend = FALSE) + 
+  labs(x = "Horizontal Movement (in.)",
+       y = "Run Value / 100") +
+  scale_color_gradient(low = "red", high = "green") +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  theme_dark() +
+  theme(plot.subtitle = element_text(hjust = 0.5))
+
+grv2_fc_2 <- Data2 %>% 
+  filter(pitch_type == "FC") %>% 
+  ggplot(aes(x = pitcher_break_z, y = rv100, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = lm, se = FALSE) + 
+  labs(x = "Vertical Movement (in.)",
+       y = "",
+       color = "Stuff+") +
+  scale_y_reverse() +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_color_gradient(low = "red", high = "green") +
+  theme_dark()+
+  theme(plot.subtitle = element_text(hjust = 0.5),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+
+grid.arrange(grv2_fc_1, grv2_fc_2, ncol = 2, top = "Run Value on Cutters by Pitch Movement")
+```
+
+##### Sinkers
+```{r Sinkers M RV, warning = FALSE, message = FALSE, echo = FALSE}
+grv2_si_1 <- Data2 %>% 
+  filter(pitch_type == "SI") %>% 
+  ggplot(aes(x = pitcher_break_x, y = rv100, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7, show.legend = FALSE) +
+  geom_smooth(method = lm, se = FALSE, show.legend = FALSE) + 
+  labs(x = "Horizontal Movement (in.)",
+       y = "Run Value / 100") +
+  scale_color_gradient(low = "red", high = "green") +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  theme_dark() +
+  theme(plot.subtitle = element_text(hjust = 0.5))
+
+grv2_si_2 <- Data2 %>% 
+  filter(pitch_type == "SI") %>% 
+  ggplot(aes(x = pitcher_break_z, y = rv100, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = lm, se = FALSE) + 
+  labs(x = "Vertical Movement (in.)",
+       y = "",
+       color = "Stuff+") +
+  scale_y_reverse() +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_color_gradient(low = "red", high = "green") +
+  theme_dark()+
+  theme(plot.subtitle = element_text(hjust = 0.5),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+
+grid.arrange(grv2_si_1, grv2_si_2, ncol = 2, top = "Run Value on Sinkers by Pitch Movement")
+```
+
+##### Sliders
+```{r Sliders M RV, warning = FALSE, message = FALSE, echo = FALSE}
+grv2_sl_1 <- Data2 %>% 
+  filter(pitch_type == "SL") %>% 
+  ggplot(aes(x = pitcher_break_x, y = rv100, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7, show.legend = FALSE) +
+  geom_smooth(method = lm, se = FALSE, show.legend = FALSE) + 
+  labs(x = "Horizontal Movement (in.)",
+       y = "Run Value / 100") +
+  scale_color_gradient(low = "red", high = "green") +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  theme_dark() +
+  theme(plot.subtitle = element_text(hjust = 0.5))
+
+grv2_sl_2 <- Data2 %>% 
+  filter(pitch_type == "SL") %>% 
+  ggplot(aes(x = pitcher_break_z, y = rv100, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = lm, se = FALSE) + 
+  labs(x = "Vertical Movement (in.)",
+       y = "",
+       color = "Stuff+") +
+  scale_y_reverse() +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_color_gradient(low = "red", high = "green") +
+  theme_dark()+
+  theme(plot.subtitle = element_text(hjust = 0.5),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+
+grid.arrange(grv2_sl_1, grv2_sl_2, ncol = 2, top = "Run Value on Sliders by Pitch Movement")
+```
+
+##### Curveballs
+```{r Curveballs M RV, warning = FALSE, message = FALSE, echo = FALSE}
+grv2_cu_1 <- Data2 %>% 
+  filter(pitch_type == "CU") %>% 
+  ggplot(aes(x = pitcher_break_x, y = rv100, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7, show.legend = FALSE) +
+  geom_smooth(method = lm, se = FALSE, show.legend = FALSE) + 
+  labs(x = "Horizontal Movement (in.)",
+       y = "Run Value / 100") +
+  scale_color_gradient(low = "red", high = "green") +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  theme_dark() +
+  theme(plot.subtitle = element_text(hjust = 0.5))
+
+grv2_cu_2 <- Data2 %>% 
+  filter(pitch_type == "CU") %>% 
+  ggplot(aes(x = pitcher_break_z, y = rv100, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = lm, se = FALSE) + 
+  labs(x = "Vertical Movement (in.)",
+       y = "",
+       color = "Stuff+") +
+  scale_y_reverse() +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_color_gradient(low = "red", high = "green") +
+  theme_dark()+
+  theme(plot.subtitle = element_text(hjust = 0.5),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+
+grid.arrange(grv2_cu_1, grv2_cu_2, ncol = 2, top = "Run Value on Curveballs by Pitch Movement")
+```
+
+##### Change-Ups
+```{r Change-Ups M RV, warning = FALSE, message = FALSE, echo = FALSE}
+grv2_ch_1 <- Data2 %>% 
+  filter(pitch_type == "CH" | pitch_type == "FS") %>% 
+  ggplot(aes(x = pitcher_break_x, y = rv100, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7, show.legend = FALSE, aes(shape = pitch_type_name), size = 2) +
+  geom_smooth(method = lm, se = FALSE, show.legend = FALSE) + 
+  labs(x = "Horizontal Movement (in.)",
+       y = "Run Value / 100",
+       shape = "Pitch Type") +
+  scale_color_gradient(low = "red", high = "green") +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_shape_manual(values = c(20, 18)) +
+  theme_dark() +
+  theme(plot.subtitle = element_text(hjust = 0.5))
+
+grv2_ch_2 <- Data2 %>% 
+  filter(pitch_type == "CH" | pitch_type == "FS") %>% 
+  ggplot(aes(x = pitcher_break_z, y = rv100, 
+             color = `Stf+ Pitch`)) +
+  geom_point(alpha = 0.7, aes(shape = pitch_type_name), size = 2) +
+  geom_smooth(method = lm, se = FALSE) + 
+  labs(x = "Vertical Movement (in.)",
+       y = "",
+       color = "Stuff+",
+       shape = "Pitch Type") +
+  scale_y_reverse() +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05)),
+                     trans = "reverse") +
+  scale_shape_manual(values = c(20, 18)) +
+  scale_color_gradient(low = "red", high = "green") +
+  theme_dark()+
+  theme(plot.subtitle = element_text(hjust = 0.5),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        legend.key = element_rect(fill = NA))
+
+grid.arrange(grv2_ch_1, grv2_ch_2, ncol = 2, top = "Run Value on Change-Ups by Pitch Movement")
+```
+
+#### {-}
+
+### {-}
+
+Similarly, these scatter plots specifically explore movement as it relates to our outcome variables. They show how both vertical and horizontal movement correlate with outcome differently based on the pitch type.
+
+This next grouping of plots moves into the one of the two primary models we are using in this report: generalized additive models (GAMs). These GAMs only take in one explanatory variable: Stuff+. The purpose of using Stuff+ is that it is a broad, all-encompassing metric that takes into account discrete pitch characteristics (with the exception of speed and movement fastball differentials). Stuff+ provides a single number summary for intra-pitch characteristics that can then be used to predict outcome via xwOBA. We used xwOBA as our response variable because it is the least noisy of the three. These plots show the relationship between our model's predicted xwOBA values using just Stuff+ and the observed xwOBA values.
+
+```{r RMSE Function, echo = FALSE, message = FALSE}
+# RMSE Function
+rmse <- function(observed, predicted){
+  n <- length(observed)
+  sqrt(sum((observed - predicted)^2) / n)}
+
+```
+
+### Intra-Pitch xwOBA GAM {.tabset}
+```{r Intra GAM, echo = FALSE, warning = FALSE, message = FALSE}
+set.seed(2004)
+
+statcast = read.csv('./Ethan-Data/Statcast/statcast_2020-2022.csv')
+pitch_types = c('FF', 'FC', 'CH', 'CU', 'SL', 'SI')
+
+remove_outliers <- function(df, col_names) {
+  for (col_name in col_names) {
+    Q1 <- quantile(df[[col_name]], 0.25)
+    Q3 <- quantile(df[[col_name]], 0.75)
+    
+    IQR <- Q3 - Q1
+    
+    lower_bound <- Q1 - 1.5 * IQR
+    upper_bound <- Q3 + 1.5 * IQR
+    
+    df <- df[df[[col_name]] >= lower_bound & df[[col_name]] <= upper_bound, ]
+  }
+  return(df)
+}
+
+inters = list()
+for (pitch_type in pitch_types) {
+  file_path = sprintf('./Ethan-Data/Inter-Pitch/%s_interpitch_2020-2022.csv', pitch_type)
+  df <- read.csv(file_path)
+  
+  df <- remove_outliers(df, col_names = c('est_woba', 'Stuff'))
+  inters[[pitch_type]] <- df
+}
+
+cv <- function(pitch, fold){
+  prepare <- function(data) {
+    folds = data %>% 
+      select(mlbAM_ID) %>% 
+      distinct(mlbAM_ID) %>% 
+      rowwise() %>%
+      mutate(group = sample(seq(1, 5, 1), 1))
+    
+    gam_data <- data %>% 
+      left_join(folds, by = 'mlbAM_ID')
+    
+    return(gam_data)
+  }
+  
+  gam_data <- prepare(inters[[pitch]])
+  
+  train <- gam_data %>% filter(group != fold)
+  gam <- gam(est_woba ~ s(Stuff), data = train, family = gaussian, method = "REML")
+  test <- gam_data %>% filter(group == fold)
+  
+  y_pred <- test %>% mutate(prediction = predict(gam, test)) %>% 
+    filter(!is.na(prediction))
+  
+  gam_pred_df = data.frame(observed = test$est_woba, prediction = y_pred$prediction)
+  return(gam_pred_df)
+}
+
+FF_preds = data.frame()
+FF_preds <- rbind(cv("FF", "1"),
+                  cv("FF", "2"),
+                  cv("FF", "3"),
+                  cv("FF", "4"),
+                  cv("FF", "5"))
+
+FF_rmses <- round(rmse(FF_preds$observed, FF_preds$prediction), 4)
+
+
+FC_preds = data.frame()
+FC_preds <- rbind(cv("FC", "1"),
+                  cv("FC", "2"),
+                  cv("FC", "3"),
+                  cv("FC", "4"),
+                  cv("FC", "5"))
+
+FC_rmses <- round(rmse(FC_preds$observed, FC_preds$prediction), 4)
+
+
+CH_preds = data.frame()
+CH_preds <- rbind(cv("CH", "1"),
+                  cv("CH", "2"),
+                  cv("CH", "3"),
+                  cv("CH", "4"),
+                  cv("CH", "5"))
+
+CH_rmses <- round(rmse(CH_preds$observed, CH_preds$prediction), 4)
+
+
+CU_preds = data.frame()
+CU_preds <- rbind(cv("CU", "1"),
+                  cv("CU", "2"),
+                  cv("CU", "3"),
+                  cv("CU", "4"),
+                  cv("CU", "5"))
+
+CU_rmses <- round(rmse(CU_preds$observed, CU_preds$prediction), 4)
+
+
+SL_preds = data.frame()
+SL_preds <- rbind(cv("SL", "1"),
+                  cv("SL", "2"),
+                  cv("SL", "3"),
+                  cv("SL", "4"),
+                  cv("SL", "5"))
+
+SL_rmses <- round(rmse(SL_preds$observed, SL_preds$prediction), 4)
+
+
+SI_preds = data.frame()
+SI_preds <- rbind(cv("SI", "1"),
+                  cv("SI", "2"),
+                  cv("SI", "3"),
+                  cv("SI", "4"),
+                  cv("SI", "5"))
+
+SI_rmses <- round(rmse(SI_preds$observed, SI_preds$prediction), 4)
+
+```
+
+#### Four-Seam
+```{r Intra GAM Four Seams, echo = FALSE, message = FALSE}
+FF_preds %>%
+  ggplot(aes(x = observed, y = prediction)) +
+  geom_point(color = "#FDB827", shape = 18, size = 2.5, alpha = 0.8) +
+  geom_smooth(se = FALSE, method = lm) +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05))) +
+  scale_x_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05))) +
+  labs(x = "Observed",
+       y = "Predicted",
+       title = paste("FF xwOBA GAM Predictions"),
+       caption = paste("RMSE:",
+                       round(rmse(FF_preds$observed, FF_preds$prediction), 4))) +
+  theme_dark() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+#### Cutters
+```{r Intra GAM Cutter, echo = FALSE, message = FALSE}
+FC_preds %>%
+  ggplot(aes(x = observed, y = prediction)) +
+  geom_point(color = "#FDB827", shape = 18, size = 2.5, alpha = 0.8) +
+  geom_smooth(se = FALSE, method = lm) +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05))) +
+  scale_x_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05))) +
+  labs(x = "Observed",
+       y = "Predicted",
+       title = paste("FC xwOBA GAM Predictions"),
+       caption = paste("RMSE:",
+                       round(rmse(FC_preds$observed, FC_preds$prediction), 4))) +
+  theme_dark() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+#### Sinkers
+```{r Intra GAM Sinkers, echo = FALSE, message = FALSE}
+SI_preds %>%
+  ggplot(aes(x = observed, y = prediction)) +
+  geom_point(color = "#FDB827", shape = 18, size = 2.5, alpha = 0.8) +
+  geom_smooth(se = FALSE, method = lm) +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05))) +
+  scale_x_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05))) +
+  labs(x = "Observed",
+       y = "Predicted",
+       title = paste("SI xwOBA GAM Predictions"),
+       caption = paste("RMSE:",
+                       round(rmse(SI_preds$observed, SI_preds$prediction), 4))) +
+  theme_dark() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+#### Sliders
+```{r Intra GAM Sliders, echo = FALSE, message = FALSE}
+SL_preds %>%
+  ggplot(aes(x = observed, y = prediction)) +
+  geom_point(color = "#FDB827", shape = 18, size = 2.5, alpha = 0.8) +
+  geom_smooth(se = FALSE, method = lm) +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05))) +
+  scale_x_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05))) +
+  labs(x = "Observed",
+       y = "Predicted",
+       title = paste("SL xwOBA GAM Predictions"),
+       caption = paste("RMSE:",
+                       round(rmse(SL_preds$observed, SL_preds$prediction), 4))) +
+  theme_dark() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+#### Curveballs
+```{r Intra GAM Curveballs, echo = FALSE, message = FALSE}
+CU_preds %>%
+  ggplot(aes(x = observed, y = prediction)) +
+  geom_point(color = "#FDB827", shape = 18, size = 2.5, alpha = 0.8) +
+  geom_smooth(se = FALSE, method = lm) +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05))) +
+  scale_x_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05))) +
+  labs(x = "Observed",
+       y = "Predicted",
+       title = paste("CU xwOBA GAM Predictions"),
+       caption = paste("RMSE:",
+                       round(rmse(CU_preds$observed, CU_preds$prediction), 4))) +
+  theme_dark() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+#### Change-Ups
+```{r Intra GAM Change-Ups, echo = FALSE, message = FALSE}
+CH_preds %>%
+  ggplot(aes(x = observed, y = prediction)) +
+  geom_point(color = "#FDB827", shape = 18, size = 2.5, alpha = 0.8) +
+  geom_smooth(se = FALSE, method = lm) +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05))) +
+  scale_x_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05))) +
+  labs(x = "Observed",
+       y = "Predicted",
+       title = paste("CH xwOBA GAM Predictions"),
+       caption = paste("RMSE:",
+                       round(rmse(CH_preds$observed, CH_preds$prediction), 4))) +
+  theme_dark() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+### {-}
+
+We used 5-fold cross validation to obtain our RMSE values in the above GAMs and in the following GAMs and random forests. For each pitch type, we assigned pitchers to a fold and ran the cross validation. 
+
+## Inter-Pitch Data Analysis
+
+The next phase of our project revolves around inter-pitch interactions. We're curious to see how differentials in speed, movement, and release point, when factored in with the discrete metric Stuff+, improve our predictions on the success of a pitch. To do this, we used both generalized additive models (GAMs) and random forests. The purpose of using both was to assess whether or not these input variables interact significantly with each other, since random forests capture these interactions while GAMs do not. We are essentially "adding on" to the GAMs that previously only took into account Stuff+ in order to see how much better they do with inter-pitch characteristics. Again, our plots show how our predicted xwOBA values do against the observed values. 
+
+### Inter-Pitch xwOBA Models {.tabset}
+
+#### GAM {.tabset}
+```{r Inter GAM, warning = FALSE, echo = FALSE, message = FALSE}
+mean_impute <- function(x) {
+  mean_value <- mean(x, na.rm = TRUE)
+  x[is.na(x)] <- mean_value
+  return(x)
+}
+
+remove_outliers <- function(df, col_names) {
+  for (col_name in col_names) {
+    Q1 <- quantile(df[[col_name]], 0.25)
+    Q3 <- quantile(df[[col_name]], 0.75)
+    
+    IQR <- Q3 - Q1
+    
+    lower_bound <- Q1 - 1.5 * IQR
+    upper_bound <- Q3 + 1.5 * IQR
+    
+    df <- df[df[[col_name]] >= lower_bound & df[[col_name]] <= upper_bound, ]
+  }
+  return(df)
+}
+
+inters = list()
+for (pitch_type in pitch_types) {
+  file_path = sprintf('./Ethan-Data/Inter-Pitch/%s_interpitch_2020-2022.csv', pitch_type)
+  df <- read.csv(file_path)
+  
+  df <- remove_outliers(df, col_names = c('est_woba', 'Stuff'))
+  df <- as.data.frame(lapply(df, mean_impute))
+  
+  inters[[pitch_type]] <- df
+}
+
+cv_inter <- function(pitch, fold){
+  prepare <- function(data) {
+    folds = data %>% 
+      select(mlbAM_ID) %>% 
+      distinct(mlbAM_ID) %>% 
+      rowwise() %>%
+      mutate(group = sample(seq(1, 5, 1), 1))
+
+    gam_data <- data %>% 
+      left_join(folds, by = 'mlbAM_ID')
+    
+    return(gam_data)
+  }
+  
+  gam_data <- prepare(inters[[pitch]])
+  
+  train <- gam_data %>% filter(group != fold)
+  
+  exclude_columns <- c("mlbAM_ID", "Year", "player_name", "pitch_usage", "run_value_per_100", "index")
+  exclude_columns <- c(exclude_columns, names(train)[grep("spin_rate", names(train))])
+  exclude_columns <- c(exclude_columns, names(train)[grep("FF", names(train))])
+  selected_data <- train[, !(names(train) %in% exclude_columns)]
+  remaining_columns <- setdiff(names(selected_data), c("est_woba"))
+  rhs <- paste('s(', remaining_columns, ', k = 3)', sep = '', collapse = ' + ')
+  fml <- paste('est_woba ~', rhs, collapse = ' ')
+
+  gam <- gam(as.formula(fml), data = train, family = gaussian, method = "REML")
+  
+  # gam <- gam(est_woba ~ s(Stuff) + s)
+  test <- gam_data %>% filter(group == fold)
+  y_pred <- test %>% mutate(prediction = predict(gam, test)) %>% 
+    filter(!is.na(prediction))
+  
+  gam_pred_df = data.frame(observed = test$est_woba, prediction = y_pred$prediction)
+  return(gam_pred_df)
+}
+
+FF_preds_inter = data.frame()
+FF_preds_inter <- rbind(cv_inter("FF", "1"),
+                  cv_inter("FF", "2"),
+                  cv_inter("FF", "3"),
+                  cv_inter("FF", "4"),
+                  cv_inter("FF", "5"))
+
+FF_rmses_inter <- round(rmse(FF_preds_inter$observed, FF_preds_inter$prediction), 4)
+
+
+
+FC_preds_inter = data.frame()
+FC_preds_inter <- rbind(cv_inter("FC", "1"),
+                  cv_inter("FC", "2"),
+                  cv_inter("FC", "3"),
+                  cv_inter("FC", "4"),
+                  cv_inter("FC", "5"))
+
+FC_rmses_inter <- round(rmse(FC_preds_inter$observed, FC_preds_inter$prediction), 4)
+
+
+SL_preds_inter = data.frame()
+SL_preds_inter <- rbind(cv_inter("SL", "1"),
+                  cv_inter("SL", "2"),
+                  cv_inter("SL", "3"),
+                  cv_inter("SL", "4"),
+                  cv_inter("SL", "5"))
+
+SL_rmses_inter <- round(rmse(SL_preds_inter$observed, SL_preds_inter$prediction), 4)
+
+
+SI_preds_inter = data.frame()
+SI_preds_inter <- rbind(cv_inter("SI", "1"),
+                  cv_inter("SI", "2"),
+                  cv_inter("SI", "3"),
+                  cv_inter("SI", "4"),
+                  cv_inter("SI", "5"))
+
+SI_rmses_inter <- round(rmse(SI_preds_inter$observed, SI_preds_inter$prediction), 4)
+
+
+
+SI_preds_inter = data.frame()
+SI_preds_inter <- rbind(cv_inter("SI", "1"),
+                  cv_inter("SI", "2"),
+                  cv_inter("SI", "3"),
+                  cv_inter("SI", "4"),
+                  cv_inter("SI", "5"))
+
+SI_rmses_inter <- round(rmse(SI_preds_inter$observed, SI_preds_inter$prediction), 4)
+
+
+
+CH_preds_inter = data.frame()
+CH_preds_inter <- rbind(cv_inter("CH", "1"),
+                  cv_inter("CH", "2"),
+                  cv_inter("CH", "3"),
+                  cv_inter("CH", "4"),
+                  cv_inter("CH", "5"))
+
+CH_rmses_inter <- round(rmse(CH_preds_inter$observed, CH_preds_inter$prediction), 4)
+
+
+CU_preds_inter = data.frame()
+CU_preds_inter <- rbind(cv_inter("CU", "1"),
+                  cv_inter("CU", "2"),
+                  cv_inter("CU", "3"),
+                  cv_inter("CU", "4"),
+                  cv_inter("CU", "5"))
+
+CU_rmses_inter <- round(rmse(CU_preds_inter$observed, CU_preds_inter$prediction), 4)
+```
+
+##### Four-Seams
+```{r Inter GAM Four Seams, echo = FALSE, message = FALSE, warning = FALSE}
+FF_preds_inter %>%
+  ggplot(aes(x = prediction, y = observed)) +
+  geom_point(color = "#FDB827", shape = 18, size = 2.5, alpha = 0.8) +
+  geom_smooth(se = FALSE, method = lm) +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05))) +
+  scale_x_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05))) +
+  labs(x = "Predicted",
+       y = "Observed",
+       title = paste("FF Inter-Pitch xwOBA GAM Predictions"),
+       caption = paste("RMSE:",
+                       round(rmse(FF_preds_inter$observed, FF_preds_inter$prediction), 4))) +
+  theme_dark() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+##### Cutters
+```{r Inter GAM Cutters, echo = FALSE, message = FALSE, warning = FALSE}
+FC_preds_inter %>%
+  ggplot(aes(x = observed, y = prediction)) +
+  geom_point(color = "#FDB827", shape = 18, size = 2.5, alpha = 0.8) +
+  geom_smooth(se = FALSE, method = lm) +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05))) +
+  scale_x_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05))) +
+  labs(x = "Observed",
+       y = "Predicted",
+       title = paste("FC Inter-Pitch xwOBA GAM Predictions"),
+       caption = paste("RMSE:",
+                       round(rmse(FC_preds_inter$observed, FC_preds_inter$prediction), 4))) +
+  theme_dark() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+##### Sinkers
+```{r Inter GAM Sinkers, echo = FALSE, message = FALSE, warning = FALSE}
+SI_preds_inter %>%
+  ggplot(aes(x = observed, y = prediction)) +
+  geom_point(color = "#FDB827", shape = 18, size = 2.5, alpha = 0.8) +
+  geom_smooth(se = FALSE, method = lm) +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05))) +
+  scale_x_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05))) +
+  labs(x = "Observed",
+       y = "Predicted",
+       title = paste("SI Inter-Pitch xwOBA GAM Predictions"),
+       caption = paste("RMSE:",
+                       round(rmse(SI_preds_inter$observed, SI_preds_inter$prediction), 4))) +
+  theme_dark() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+##### Sliders
+```{r Inter GAM Sliders, echo = FALSE, message = FALSE, warning = FALSE}
+SL_preds_inter %>%
+  ggplot(aes(x = observed, y = prediction)) +
+  geom_point(color = "#FDB827", shape = 18, size = 2.5, alpha = 0.8) +
+  geom_smooth(se = FALSE, method = lm) +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05))) +
+  scale_x_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05))) +
+  labs(x = "Observed",
+       y = "Predicted",
+       title = paste("SL Inter-Pitch xwOBA GAM Predictions"),
+       caption = paste("RMSE:",
+                       round(rmse(SL_preds_inter$observed, SL_preds_inter$prediction), 4))) +
+  theme_dark() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+##### Curveballs
+```{r Inter GAM Curveballs, echo = FALSE, message = FALSE, warning = FALSE}
+CU_preds_inter %>%
+  ggplot(aes(x = observed, y = prediction)) +
+  geom_point(color = "#FDB827", shape = 18, size = 2.5, alpha = 0.8) +
+  geom_smooth(se = FALSE, method = lm) +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05))) +
+  scale_x_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05))) +
+  labs(x = "Observed",
+       y = "Predicted",
+       title = paste("CU Inter-Pitch xwOBA GAM Predictions"),
+       caption = paste("RMSE:",
+                       round(rmse(CU_preds_inter$observed, CU_preds_inter$prediction), 4))) +
+  theme_dark() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+##### Change-Ups
+```{r Inter GAM Change-Up, echo = FALSE, message = FALSE, warning = FALSE}
+
+CH_preds_inter %>%
+  ggplot(aes(x = observed, y = prediction)) +
+  geom_point(color = "#FDB827", shape = 18, size = 2.5, alpha = 0.8) +
+  geom_smooth(se = FALSE, method = lm) +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05))) +
+  scale_x_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05))) +
+  labs(x = "Observed",
+       y = "Predicted",
+       title = paste("CH Inter-Pitch xwOBA GAM Predictions"),
+       caption = paste("RMSE:",
+                       round(rmse(CH_preds_inter$observed, CH_preds_inter$prediction), 4))) +
+  theme_dark() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+#### {-}
+
+#### Random Forest {.tabset}
+```{r Inter RF, warning = FALSE, echo = FALSE, message = FALSE}
+remove_outliers <- function(df, col_names) {
+  for (col_name in col_names) {
+    Q1 <- quantile(df[[col_name]], 0.25)
+    Q3 <- quantile(df[[col_name]], 0.75)
+    
+    IQR <- Q3 - Q1
+    
+    lower_bound <- Q1 - 1.5 * IQR
+    upper_bound <- Q3 + 1.5 * IQR
+    
+    df <- df[df[[col_name]] >= lower_bound & df[[col_name]] <= upper_bound, ]
+  }
+  return(df)
+}
+
+inters = list()
+for (pitch_type in pitch_types) {
+  file_path = sprintf('./Ethan-Data/Inter-Pitch/%s_interpitch_2020-2022.csv', pitch_type)
+  df <- read.csv(file_path)
+  
+  df <- remove_outliers(df, col_names = c('est_woba', 'Stuff'))
+  df <- as.data.frame(lapply(df, mean_impute))
+  
+  inters[[pitch_type]] <- df
+}
+
+
+cv_inter_rf <- function(pitch, fold){
+  prepare <- function(data) {
+    folds = data %>% 
+      select(mlbAM_ID) %>% 
+      distinct(mlbAM_ID) %>% 
+      rowwise() %>%
+      mutate(group = sample(seq(1, 5, 1), 1))
+
+    rf_data <- data %>% 
+      left_join(folds, by = 'mlbAM_ID')
+    
+    return(rf_data)
+  }
+  
+  rf_data <- prepare(inters[[pitch]])
+  
+  train <- rf_data %>% filter(group != fold)
+  test <- rf_data %>% filter(group == fold)
+  
+  exclude_columns <- c("mlbAM_ID", "Year", "player_name", "pitch_usage", "run_value_per_100", "index", "group")
+  exclude_columns <- c(exclude_columns, names(train)[grep("spin_rate", names(train))])
+  exclude_columns <- c(exclude_columns, names(train)[grep("FF", names(train))])
+  selected_data <- train[, !(names(train) %in% exclude_columns)]
+  rf <- ranger(est_woba ~ ., data = selected_data, num.trees = 500,
+                      importance = "impurity") 
+  
+  # gam <- gam(est_woba ~ s(Stuff) + s)
+  y_pred <- predict(rf, test) %>% as.data.frame()
+  
+  rf_pred_df = data.frame(observed = test$est_woba, prediction = y_pred$prediction)
+  return(rf_pred_df)
+}
+
+FF_preds_inter_rf = data.frame()
+FF_preds_inter_rf <- rbind(cv_inter_rf("FF", "1"),
+                  cv_inter_rf("FF", "2"),
+                  cv_inter_rf("FF", "3"),
+                  cv_inter_rf("FF", "4"),
+                  cv_inter_rf("FF", "5"))
+
+FF_rmses_inter_rf <- round(rmse(FF_preds_inter_rf$observed, FF_preds_inter_rf$prediction), 4)
+
+
+
+
+FC_preds_inter_rf = data.frame()
+FC_preds_inter_rf <- rbind(cv_inter_rf("FC", "1"),
+                  cv_inter_rf("FC", "2"),
+                  cv_inter_rf("FC", "3"),
+                  cv_inter_rf("FC", "4"),
+                  cv_inter_rf("FC", "5"))
+
+FC_rmses_inter_rf <- round(rmse(FC_preds_inter_rf$observed, FC_preds_inter_rf$prediction), 4)
+
+
+
+SL_preds_inter_rf = data.frame()
+SL_preds_inter_rf <- rbind(cv_inter_rf("SL", "1"),
+                  cv_inter_rf("SL", "2"),
+                  cv_inter_rf("SL", "3"),
+                  cv_inter_rf("SL", "4"),
+                  cv_inter_rf("SL", "5"))
+
+SL_rmses_inter_rf <- round(rmse(SL_preds_inter_rf$observed, SL_preds_inter_rf$prediction), 4)
+
+
+
+SI_preds_inter_rf = data.frame()
+SI_preds_inter_rf <- rbind(cv_inter_rf("SI", "1"),
+                  cv_inter_rf("SI", "2"),
+                  cv_inter_rf("SI", "3"),
+                  cv_inter_rf("SI", "4"),
+                  cv_inter_rf("SI", "5"))
+
+SI_rmses_inter_rf <- round(rmse(SI_preds_inter_rf$observed, SI_preds_inter_rf$prediction), 4)
+
+
+
+CH_preds_inter_rf = data.frame()
+CH_preds_inter_rf <- rbind(cv_inter_rf("CH", "1"),
+                  cv_inter_rf("CH", "2"),
+                  cv_inter_rf("CH", "3"),
+                  cv_inter_rf("CH", "4"),
+                  cv_inter_rf("CH", "5"))
+
+CH_rmses_inter_rf <- round(rmse(CH_preds_inter_rf$observed, CH_preds_inter_rf$prediction), 4)
+
+
+
+CU_preds_inter_rf = data.frame()
+CU_preds_inter_rf <- rbind(cv_inter_rf("CU", "1"),
+                  cv_inter_rf("CU", "2"),
+                  cv_inter_rf("CU", "3"),
+                  cv_inter_rf("CU", "4"),
+                  cv_inter_rf("CU", "5"))
+
+CU_rmses_inter_rf <- round(rmse(CU_preds_inter_rf$observed, CU_preds_inter_rf$prediction), 4)
+
+```
+
+##### Four-Seams
+```{r Inter RF Four Seams, warning = FALSE, echo = FALSE, message = FALSE}
+
+FF_preds_inter_rf %>%
+  ggplot(aes(x = prediction, y = observed)) +
+  geom_point(color = "#FDB827", shape = 18, size = 2.5, alpha = 0.8) +
+  geom_smooth(se = FALSE, method = lm) +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05))) +
+  scale_x_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05))) +
+  labs(x = "Predicted",
+       y = "Observed",
+       title = paste("FF Inter-Pitch xwOBA RF Predictions"),
+       caption = paste("RMSE:",
+                       round(rmse(FF_preds_inter_rf$observed, FF_preds_inter_rf$prediction), 4))) +
+  theme_dark() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+##### Cutters
+```{r Inter RF Cutters, warning = FALSE, echo = FALSE, message = FALSE}
+FC_preds_inter_rf %>%
+  ggplot(aes(x = prediction, y = observed)) +
+  geom_point(color = "#FDB827", shape = 18, size = 2.5, alpha = 0.8) +
+  geom_smooth(se = FALSE, method = lm) +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05))) +
+  scale_x_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05))) +
+  labs(x = "Predicted",
+       y = "Observed",
+       title = paste("FC Inter-Pitch xwOBA RF Predictions"),
+       caption = paste("RMSE:",
+                       round(rmse(FC_preds_inter_rf$observed, FC_preds_inter_rf$prediction), 4))) +
+  theme_dark() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+##### Sinkers
+```{r Inter RF Sinkers, warning = FALSE, echo = FALSE, message = FALSE}
+SI_preds_inter_rf %>%
+  ggplot(aes(x = prediction, y = observed)) +
+  geom_point(color = "#FDB827", shape = 18, size = 2.5, alpha = 0.8) +
+  geom_smooth(se = FALSE, method = lm) +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05))) +
+  scale_x_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05))) +
+  labs(x = "Predicted",
+       y = "Observed",
+       title = paste("SI Inter-Pitch xwOBA RF Predictions"),
+       caption = paste("RMSE:",
+                       round(rmse(SI_preds_inter_rf$observed, SI_preds_inter_rf$prediction), 4))) +
+  theme_dark() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+##### Sliders
+```{r Inter RF Sliders, warning = FALSE, echo = FALSE, message = FALSE}
+SL_preds_inter_rf %>%
+  ggplot(aes(x = prediction, y = observed)) +
+  geom_point(color = "#FDB827", shape = 18, size = 2.5, alpha = 0.8) +
+  geom_smooth(se = FALSE, method = lm) +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05))) +
+  scale_x_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05))) +
+  labs(x = "Predicted",
+       y = "Observed",
+       title = paste("SL Inter-Pitch xwOBA RF Predictions"),
+       caption = paste("RMSE:",
+                       round(rmse(SL_preds_inter_rf$observed, SL_preds_inter_rf$prediction), 4))) +
+  theme_dark() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+##### Curveballs
+```{r Inter RF Curveballs, warning = FALSE, echo = FALSE, message = FALSE}
+CU_preds_inter_rf %>%
+  ggplot(aes(x = prediction, y = observed)) +
+  geom_point(color = "#FDB827", shape = 18, size = 2.5, alpha = 0.8) +
+  geom_smooth(se = FALSE, method = lm) +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05))) +
+  scale_x_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05))) +
+  labs(x = "Predicted",
+       y = "Observed",
+       title = paste("CU Inter-Pitch xwOBA RF Predictions"),
+       caption = paste("RMSE:",
+                       round(rmse(CU_preds_inter_rf$observed, CU_preds_inter_rf$prediction), 4))) +
+  theme_dark() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+##### Change-Ups
+```{r Inter RF Change-Ups, warning = FALSE, echo = FALSE, message = FALSE}
+CH_preds_inter_rf %>%
+  ggplot(aes(x = prediction, y = observed)) +
+  geom_point(color = "#FDB827", shape = 18, size = 2.5, alpha = 0.8) +
+  geom_smooth(se = FALSE, method = lm) +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05))) +
+  scale_x_continuous(labels = scales::comma_format(accuracy = 0.001),
+                     expand = expansion(mult = c(0, 0.05))) +
+  labs(x = "Predicted",
+       y = "Observed",
+       title = paste("CH Inter-Pitch xwOBA RF Predictions"),
+       caption = paste("RMSE:",
+                       round(rmse(CH_preds_inter_rf$observed, CH_preds_inter_rf$prediction), 4))) +
+  theme_dark() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+#### {-}
+
+### {-}
+
+
+## Comparative
+```{r RMSE Collection, echo = FALSE}
+intra_gam <- cbind(c("FF", "FC", "SI", "SL", "CU", "CH"),
+  c(rmse(FF_preds$observed, FF_preds$prediction),
+    rmse(FC_preds$observed, FC_preds$prediction),
+    rmse(SI_preds$observed, SI_preds$prediction),
+    rmse(SL_preds$observed, SL_preds$prediction),
+    rmse(CU_preds$observed, CU_preds$prediction),
+    rmse(CH_preds$observed, CH_preds$prediction))) %>% 
+  as.data.frame() %>% 
+  rename(pitch_type = V1, "Intra_GAM" = V2)
+
+inter_gam <- cbind(c("FF", "FC", "SI", "SL", "CU", "CH"),
+  c(rmse(FF_preds_inter$observed, FF_preds_inter$prediction),
+    rmse(FC_preds_inter$observed, FC_preds_inter$prediction),
+    rmse(SI_preds_inter$observed, SI_preds_inter$prediction),
+    rmse(SL_preds_inter$observed, SL_preds_inter$prediction),
+    rmse(CU_preds_inter$observed, CU_preds_inter$prediction),
+    rmse(CH_preds_inter$observed, CH_preds_inter$prediction))) %>% 
+  as.data.frame() %>% 
+  rename(pitch_type = V1, "Inter_GAM" = V2)
+
+inter_rf <- cbind(c("FF", "FC", "SI", "SL", "CU", "CH"),
+  c(rmse(FF_preds_inter_rf$observed, FF_preds_inter_rf$prediction),
+    rmse(FC_preds_inter_rf$observed, FC_preds_inter_rf$prediction),
+    rmse(SI_preds_inter_rf$observed, SI_preds_inter_rf$prediction),
+    rmse(SL_preds_inter_rf$observed, SL_preds_inter_rf$prediction),
+    rmse(CU_preds_inter_rf$observed, CU_preds_inter_rf$prediction),
+    rmse(CH_preds_inter_rf$observed, CH_preds_inter_rf$prediction))) %>% 
+  as.data.frame() %>% 
+  rename(pitch_type = V1, "Inter_RF" = V2)
+
+ff <- inters[["FF"]] %>% 
+  mutate(prediction = mean(est_woba))
+
+fc <- inters[["FC"]] %>% 
+  mutate(prediction = mean(est_woba))
+
+ch <- inters[["CH"]] %>% 
+  mutate(prediction = mean(est_woba))
+
+cu <- inters[["CU"]] %>% 
+  mutate(prediction = mean(est_woba))
+
+sl <- inters[["SL"]] %>% 
+  mutate(prediction = mean(est_woba))
+
+si <- inters[["SI"]] %>% 
+  mutate(prediction = mean(est_woba))
+
+intercept <- cbind(c("FF", "FC", "SI", "SL", "CU", "CH"),
+  c(round(rmse(ff$est_woba, ff$prediction), 4),
+rmse(fc$est_woba, fc$prediction),
+rmse(si$est_woba, si$prediction),
+rmse(sl$est_woba, sl$prediction),
+rmse(cu$est_woba, cu$prediction),
+rmse(ch$est_woba, ch$prediction))) %>% 
+  as.data.frame() %>% 
+  rename(pitch_type = V1, "Intercept" = V2)
+
+rmse_data <- intercept %>% 
+  left_join(intra_gam, by = "pitch_type") %>% 
+  left_join(inter_gam, by = "pitch_type") %>% 
+  left_join(inter_rf, by = "pitch_type")
+
+rmse_data <- rmse_data %>% 
+  mutate(
+    Intercept = as.numeric(Intercept),
+    Intra_GAM = as.numeric(Intra_GAM),
+    Inter_GAM = as.numeric(Inter_GAM),
+    Inter_RF = as.numeric(Inter_RF))
+```
+
+Now to compare the various models we've used. Both the intra-pitch (based on Stuff+) and inter-pitch (based on differentials) models were generally effective at predicting xwOBA outcome, but the central question of our project is to determine if inter-pitch metrics create an edge in overall pitch evaluation. To do this, we compared the root mean squared error (RMSE) of our various models. For each individual model, we calculated the RMSE by pitch to analyze which pitches it performed the best on. We compared the RMSEs across models through a box plot.    
+
+### Model Accuracy Comparison {.tabset}
+
+#### RMSE Comparison
+```{r RMSE Comp, echo = FALSE}
+rmse_pivot <- rmse_data %>% 
+  pivot_longer(c(Intercept:Inter_RF)) %>% 
+  rename(RMSE = value, model = name)
+
+rmse_pivot <- rmse_pivot %>% 
+  mutate(RMSE = as.numeric(RMSE))
+
+rmse_pivot %>% 
+  mutate(pitch_type = str_replace(pitch_type, "FF", "Four-Seam"),
+         pitch_type = str_replace(pitch_type, "FC", "Cutter"),
+         pitch_type = str_replace(pitch_type, "SI", "Sinker"),
+         pitch_type = str_replace(pitch_type, "SL", "Slider"),
+         pitch_type = str_replace(pitch_type, "CU", "Curveball"),
+         pitch_type = str_replace(pitch_type, "CH", "Change-Up")) %>%
+  ggplot(aes(x = model, y = RMSE)) +
+  geom_boxplot(color = "white", show.legend = FALSE, aes(fill = model)) +
+  geom_jitter(width = 0, aes(color = pitch_type)) + 
+  theme_dark() +
+  labs(x = "Model", 
+       color = "Pitch")
+
+rmse_data %>%
+  mutate(Intercept = round(Intercept, 4),
+    Intra_GAM = round(Intra_GAM, 4),
+    Inter_GAM = round(Inter_GAM, 4),
+    Inter_RF = round(Inter_RF,4)) %>% 
+  mutate(pitch_type = str_replace(pitch_type, "FF", "Four-Seam"),
+         pitch_type = str_replace(pitch_type, "FC", "Cutter"),
+         pitch_type = str_replace(pitch_type, "SI", "Sinker"),
+         pitch_type = str_replace(pitch_type, "SL", "Slider"),
+         pitch_type = str_replace(pitch_type, "CU", "Curveball"),
+         pitch_type = str_replace(pitch_type, "CH", "Change-Up")) %>% 
+  kable(digits = 4, align = "c",
+        col.names = c("Pitch", "Intercept", "Intra-Pitch GAM", 
+                      "Inter-Pitch GAM", "Inter-Pitch RF")) %>% 
+  kable_styling(full_width = T)
+```
+
+#### Intra-Pitch GAM
+```{r RMSE Intra GAM, echo = FALSE}
+rmse_data %>% 
+  select(pitch_type, Intra_GAM) %>% 
+  mutate(Intra_GAM = round(Intra_GAM, 4)) %>% 
+  ggplot(aes(x = pitch_type, y = Intra_GAM, color = pitch_type)) +
+  geom_point(show.legend = FALSE, size = 2) +
+  labs(x = "Pitch",
+       y = "RMSE",
+       title = "Root Mean Squared Error for Intra-Pitch GAM") +
+  theme_dark()
+```
+
+#### Inter-Pitch GAM
+```{r RMSE Inter GAM, echo = FALSE}
+rmse_data %>% 
+  select(pitch_type, Inter_GAM) %>% 
+  mutate(Inter_GAM = round(Inter_GAM, 4)) %>% 
+  ggplot(aes(x = pitch_type, y = Inter_GAM, color = pitch_type)) +
+  geom_point(show.legend = FALSE, size = 2) +
+  labs(x = "Pitch",
+       y = "RMSE",
+       title = "Root Mean Squared Error for Inter-Pitch GAM") +
+  theme_dark()
+```
+
+#### Inter-Pitch Random Forest
+```{r RMSE Inter RF, echo = FALSE}
+rmse_data %>% 
+  select(pitch_type, Inter_RF) %>%
+  mutate(Inter_RF = round(Inter_RF, 4)) %>% 
+  ggplot(aes(x = pitch_type, y = Inter_RF, color = pitch_type)) +
+  geom_point(show.legend = FALSE, size = 2) +
+  labs(x = "Pitch",
+       y = "RMSE",
+       title = "Root Mean Squared Error for Inter-Pitch Random Forest") +
+  theme_dark()
+```
+
+### {-}
+
+
+```{r Delete Environment, echo = FALSE, eval = FALSE}
+# PC wOBA
+rm(g_ch_1)
+rm(g_ch_2)
+rm(g_cu_1)
+rm(g_cu_2)
+rm(g_sl_1)
+rm(g_sl_2)
+rm(g_fc_1)
+rm(g_fc_2)
+rm(g_ff_1)
+rm(g_ff_2)
+rm(g_si_1)
+rm(g_si_2)
+
+# PC xwOBA
+rm(gx_ch_1)
+rm(gx_ch_2)
+rm(gx_cu_1)
+rm(gx_cu_2)
+rm(gx_ff_1)
+rm(gx_ff_2)
+rm(gx_fc_1)
+rm(gx_fc_2)
+rm(gx_si_1)
+rm(gx_si_2)
+rm(gx_sl_1)
+rm(gx_sl_2)
+
+# PC Run Value
+rm(grv_ch_1)
+rm(grv_ch_2)
+rm(grv_cu_1)
+rm(grv_cu_2)
+rm(grv_sl_1)
+rm(grv_sl_2)
+rm(grv_fc_1)
+rm(grv_fc_2)
+rm(grv_ff_1)
+rm(grv_ff_2)
+rm(grv_si_1)
+rm(grv_si_2)
+
+# VIP wOBA
+rm(changeup_model)
+rm(changeup_reduced)
+rm(curveball_model)
+rm(curveball_reduced)
+rm(slider_model)
+rm(slider_reduced)
+rm(fastball_model)
+rm(fastball_reduced)
+rm(fourseam_reduced)
+rm(cutter_reduced)
+rm(sinker_reduced)
+
+# VIP xwOBA
+rm(x_changeup_model)
+rm(x_changeup_reduced)
+rm(x_curveball_model)
+rm(x_curveball_reduced)
+rm(x_fastball_model)
+rm(x_fastball_reduced)
+rm(x_slider_model)
+rm(x_slider_reduced)
+rm(x_fourseam_reduced)
+rm(x_cutter_reduced)
+rm(x_sinker_reduced)
+
+# VIP Run Value
+rm(rv_changeup_model)
+rm(rv_changeup_reduced)
+rm(rv_curveball_model)
+rm(rv_curveball_reduced)
+rm(rv_slider_model)
+rm(rv_slider_reduced)
+rm(rv_fastball_model)
+rm(rv_fastball_reduced)
+rm(rv_fourseam_reduced)
+rm(rv_cutter_reduced)
+rm(rv_sinker_reduced)
+
+# PM wOBA
+rm(g2_ch_1)
+rm(g2_ch_2)
+rm(g2_cu_1)
+rm(g2_cu_2)
+rm(g2_fc_1)
+rm(g2_fc_2)
+rm(g2_ff_1)
+rm(g2_ff_2)
+rm(g2_si_1)
+rm(g2_si_2)
+rm(g2_sl_1)
+rm(g2_sl_2)
+
+# PM xwOBA
+rm(gx2_ch_1)
+rm(gx2_ch_2)
+rm(gx2_cu_1)
+rm(gx2_cu_2)
+rm(gx2_fc_1)
+rm(gx2_fc_2)
+rm(gx2_ff_1)
+rm(gx2_ff_2)
+rm(gx2_si_1)
+rm(gx2_si_2)
+rm(gx2_sl_1)
+rm(gx2_sl_2)
+
+# PM Run Value
+rm(grv2_ch_1)
+rm(grv2_ch_2)
+rm(grv2_cu_1)
+rm(grv2_cu_2)
+rm(grv2_fc_1)
+rm(grv2_fc_2)
+rm(grv2_ff_1)
+rm(grv2_ff_2)
+rm(grv2_si_1)
+rm(grv2_si_2)
+rm(grv2_sl_1)
+rm(grv2_sl_2)
+
+```
+
+<br>
+
+# Results Summary
+
+The comparison of our models shows that utilizing variable interactions and interpitch dynamics improves the accuracy of xwOBA predictions. While it is difficult to improve upon Stuff+, a metric that has been developed and fine-tuned for years, our layered inter-pitch models were comparable and, in some cases, more effective than GAMs that only took into account Stuff+. 
+
+# Looking Ahead 
+
+Our next step is to take into account the rates of pitch-pair sequences and use them as features in our models. Doing so would further integrate inter-pitch dynamics and the effect that pitch sequencing has on outcome. Next, there were extreme outliers in our models that affected our resulting RMSE and led to unrealistic xwOBA values. Looking into why these outliers exist and taking steps to adjust our predictions accordingly will lead to more consistently accurate xwOBA values. Finally, we would look into exploring models outside of GAMs since inter-pitch dynamics appear to have
+more complex relationships with xwOBA than GAMs can capture. Further adjust the tuning parameters of our models would add to their sophistication. 
+
+# Acknowledgements 
+
+We would like to thank Meg Ellingwood and Shamindra Shrotriya, the leaders of the Carnegie Mellon Summer Undergraduate Research Experience in Statistics, for their invaluable knowledge, guidance, and instruction throughout this research experience. This project would not have been possible without the help of Dr. Ron Yurko and Sean Ahmed, Pirates Director of R&D. We would like to thank the entire Carnegie Mellon Sports Analytics Camp teaching team for their support and guidance during this project.  
+
+
+# Citations
+
+[1] Sammon, W., & Sarris, E. (2023, July 7). Fall of the slider: *Why are hitters feasting on MLB’s once-deadly breaking ball?* The Athletic. https://theathletic.com/4671150/2023/07/07/mlb-sliders-hitters-success/ 
+
+Major League Leaderboards "2020-2022 " Pitchers. FanGraphs Baseball. (n.d.). https://www.fangraphs.com/leaders.aspx?pos=all&stats=pit&lg=all&qual=y&type=36&season=2022&month=0&season1=2020&ind=1&team=0&rost=0&age=0&filter=&players=0&startdate=&enddate=
+
+Sammon, W., & Sarris, E. (2023, July 7). Fall of the slider: Why are hitters feasting on MLB’s once-deadly breaking ball? The Athletic. https://theathletic.com/4671150/2023/07/07/mlb-sliders-hitters-success/ 
+
+Jldbc. (n.d.). JLDBC/Pybaseball: Pull current and historical baseball statistics using Python (Statcast, Baseball Reference, fangraphs). GitHub. https://github.com/jldbc/pybaseball 
+
+Statcast Pitch Arsenal Stats Leaderboard. baseballsavant. (n.d.). https://baseballsavant.mlb.com/leaderboard/pitch-arsenal-stats
+
+Statcast Pitch Movement Leaderboard. baseballsavant. (n.d.). https://baseballsavant.mlb.com/leaderboard/pitch-movement 
+
+
+
+

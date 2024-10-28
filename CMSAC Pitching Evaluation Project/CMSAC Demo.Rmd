@@ -1,0 +1,471 @@
+---
+title: "Implementation"
+author: "Evan Wu"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    code_folding: hide
+---
+```{r Library, warning = FALSE, message = FALSE}
+library(tidyverse)
+library(ranger)
+library(Metrics)
+library(mgcv)
+library(knitr)
+
+set.seed(840172)
+```
+
+```{r Mean Impute Function}
+
+mean_impute <- function(x) {
+  mean_value <- mean(x, na.rm = TRUE)
+  x[is.na(x)] <- mean_value
+  return(x)
+}
+
+
+mean_impute_all_columns <- function(data) {
+  for (col in names(data)) {
+    if (is.numeric(data[[col]])) {
+      mean_value <- mean(data[[col]], na.rm = TRUE)
+      data[[col]][is.na(data[[col]])] <- mean_value
+    }
+  }
+  return(data)
+}
+
+```
+
+
+```{r Original Data, warning = FALSE, message = FALSE}
+arsenals <- read_csv("Updated Data/arsenal_stats.csv") %>% 
+  rename(player_name = `last_name, first_name`) %>% 
+  select(player_name, player_id, Season, pitch_type, est_woba, woba, run_value)
+
+xwOBA_si <- arsenals %>% 
+  filter(pitch_type == "SIFT") %>% 
+  select(player_id, Season, est_woba)
+
+xwOBA_sl <- arsenals %>% 
+  filter(pitch_type == "SL") %>% 
+  select(player_id, Season, est_woba)
+
+xwOBA_cu <- arsenals %>% 
+  filter(pitch_type == "CUKC") %>% 
+  select(player_id, Season, est_woba)
+
+xwOBA_ch <- arsenals %>% 
+  filter(pitch_type == "CH") %>% 
+  select(player_id, Season, est_woba)
+
+xwOBA_fc <- arsenals %>% 
+  filter(pitch_type == "FC") %>% 
+  select(player_id, Season, est_woba)
+
+xwOBA_ff <- arsenals %>% 
+  filter(pitch_type == "FF") %>% 
+  select(player_id, Season, est_woba)
+
+
+si <- read_csv("Updated Data/SI_interpitch_2020-2023.csv") %>% 
+  select(-...1:-player_name) %>% 
+left_join(xwOBA_si, by = c("mlbAM_ID" = "player_id", "Season" = "Season")) %>% 
+  filter(!is.na(est_woba)) %>% 
+  mean_impute_all_columns()
+  # mutate_all(~ifelse(is.na(.), 100, .))
+
+sl <- read_csv("Updated Data/SL_interpitch_2020-2023.csv") %>% 
+  select(-...1:-player_name) %>% 
+left_join(xwOBA_sl, by = c("mlbAM_ID" = "player_id", "Season" = "Season")) %>% 
+  filter(!is.na(est_woba)) %>% 
+  mean_impute_all_columns()
+  # mutate_all(~ifelse(is.na(.), 100, .))
+
+cu <- read_csv("Updated Data/CU_interpitch_2020-2023.csv") %>% 
+  select(-...1:-player_name) %>% 
+left_join(xwOBA_cu, by = c("mlbAM_ID" = "player_id", "Season" = "Season")) %>% 
+  filter(!is.na(est_woba)) %>% 
+  mean_impute_all_columns()
+  # mutate_all(~ifelse(is.na(.), 100, .))
+
+ch <- read_csv("Updated Data/CH_interpitch_2020-2023.csv") %>% 
+  select(-...1:-player_name) %>% 
+left_join(xwOBA_ch, by = c("mlbAM_ID" = "player_id", "Season" = "Season")) %>% 
+  filter(!is.na(est_woba)) %>% 
+  mean_impute_all_columns()
+  # mutate_all(~ifelse(is.na(.), 100, .))
+
+fc <- read_csv("Updated Data/FC_interpitch_2020-2023-3.csv") %>% 
+  select(-...1:-player_name) %>% 
+left_join(xwOBA_fc, by = c("mlbAM_ID" = "player_id", "Season" = "Season")) %>% 
+  filter(!is.na(est_woba)) %>% 
+  mean_impute_all_columns()
+  # mutate_all(~ifelse(is.na(.), 100, .))
+
+ff <- read_csv("Updated Data/FF_interpitch_2020-2023.csv") %>% 
+  select(-...1:-player_name) %>% 
+left_join(xwOBA_ff, by = c("mlbAM_ID" = "player_id", "Season" = "Season")) %>% 
+  filter(!is.na(est_woba)) %>% 
+  mean_impute_all_columns()
+  # mutate_all(~ifelse(is.na(.), 100, .))
+
+```
+
+```{r Test Data, warning = FALSE, message = FALSE}
+si_test <- si %>% 
+  filter(Season != 2023) %>% 
+  filter(Season != 2020) %>% 
+  select(-mlbAM_ID, -Season)
+
+sl_test <- sl %>% 
+  filter(Season != 2023) %>% 
+  filter(Season != 2020) %>%
+  select(-mlbAM_ID, -Season)
+
+cu_test <- cu %>% 
+  filter(Season != 2023) %>% 
+  filter(Season != 2020) %>%
+  select(-mlbAM_ID, -Season)
+
+ch_test <- ch %>% 
+  filter(Season != 2023) %>% 
+  filter(Season != 2020) %>%
+  select(-mlbAM_ID, -Season)
+
+fc_test <- fc %>% 
+  filter(Season != 2023) %>% 
+  filter(Season != 2020) %>%
+  select(-mlbAM_ID, -Season)
+
+ff_test <- ff %>% 
+  filter(Season != 2023) %>% 
+  filter(Season != 2020) %>%
+  select(-mlbAM_ID, -Season)
+```
+
+```{r Bootstrapping Data}
+num_bootstraps <- 30
+
+# Sinker
+bootstrapped_samples_si <- list()
+
+for (i in 1:num_bootstraps) {
+  
+  bootstrapped_sample_si <- si_test[sample(nrow(si_test), replace = TRUE), ]
+  
+  bootstrapped_samples_si[[as.character(i)]] <- bootstrapped_sample_si
+}
+
+si_test_gam <- do.call(rbind, bootstrapped_samples_si)
+
+
+
+# Slider
+bootstrapped_samples_sl <- list()
+
+for (i in 1:num_bootstraps) {
+  
+  bootstrapped_sample_sl <- sl_test[sample(nrow(sl_test), replace = TRUE), ]
+  
+  bootstrapped_samples_sl[[as.character(i)]] <- bootstrapped_sample_sl
+}
+
+sl_test_gam <- do.call(rbind, bootstrapped_samples_sl)
+
+
+
+# Curveball
+bootstrapped_samples_cu <- list()
+
+for (i in 1:num_bootstraps) {
+  
+  bootstrapped_sample_cu <- cu_test[sample(nrow(cu_test), replace = TRUE), ]
+  
+  bootstrapped_samples_cu[[as.character(i)]] <- bootstrapped_sample_cu
+}
+
+cu_test_gam <- do.call(rbind, bootstrapped_samples_cu)
+
+
+
+# Change-Up
+bootstrapped_samples_ch <- list()
+
+for (i in 1:num_bootstraps) {
+  
+  bootstrapped_sample_ch <- ch_test[sample(nrow(ch_test), replace = TRUE), ]
+  
+  bootstrapped_samples_ch[[as.character(i)]] <- bootstrapped_sample_ch
+}
+
+ch_test_gam <- do.call(rbind, bootstrapped_samples_ch)
+
+
+
+# Cutter
+bootstrapped_samples_fc <- list()
+
+for (i in 1:num_bootstraps) {
+  
+  bootstrapped_sample_fc <- fc_test[sample(nrow(fc_test), replace = TRUE), ]
+  
+  bootstrapped_samples_fc[[as.character(i)]] <- bootstrapped_sample_fc
+}
+
+fc_test_gam <- do.call(rbind, bootstrapped_samples_fc)
+
+
+
+# Cutter
+bootstrapped_samples_ff <- list()
+
+for (i in 1:num_bootstraps) {
+  
+  bootstrapped_sample_ff <- ff_test[sample(nrow(ff_test), replace = TRUE), ]
+  
+  bootstrapped_samples_ff[[as.character(i)]] <- bootstrapped_sample_ff
+}
+
+ff_test_gam <- do.call(rbind, bootstrapped_samples_ff)
+
+```
+
+```{r 2023 Data, warning = FALSE, message = FALSE}
+si_2023 <- si %>% 
+  filter(Season == 2023) %>% 
+  select(-mlbAM_ID, -Season)
+
+sl_2023 <- sl %>% 
+  filter(Season == 2023) %>% 
+  select(-mlbAM_ID, -Season)
+
+cu_2023 <- cu %>% 
+  filter(Season == 2023) %>% 
+  select(-mlbAM_ID, -Season)
+
+ch_2023 <- ch %>% 
+  filter(Season == 2023) %>% 
+  select(-mlbAM_ID, -Season)
+
+fc_2023 <- fc %>% 
+  filter(Season == 2023) %>% 
+  select(-mlbAM_ID, -Season)
+
+ff_2023 <- ff %>% 
+  filter(Season == 2023) %>% 
+  select(-mlbAM_ID, -Season)
+```
+
+```{r Inter RF Model}
+si_model <- ranger(est_woba ~ ., data = si_test)
+
+sl_model <- ranger(est_woba ~ ., data = sl_test)
+
+cu_model <- ranger(est_woba ~ ., data = cu_test)
+
+ch_model <- ranger(est_woba ~ ., data = ch_test)
+
+fc_model <- ranger(est_woba ~ ., data = fc_test)
+
+ff_model <- ranger(est_woba ~ ., data = ff_test)
+```
+
+```{r Intra RF Model}
+si_model_rf2 <- ranger(est_woba ~ Stuff, data = si_test)
+
+sl_model_rf2 <- ranger(est_woba ~ Stuff, data = sl_test)
+
+cu_model_rf2 <- ranger(est_woba ~ Stuff, data = cu_test)
+
+ch_model_rf2 <- ranger(est_woba ~ Stuff, data = ch_test)
+
+fc_model_rf2 <- ranger(est_woba ~ Stuff, data = fc_test)
+
+ff_model_rf2 <- ranger(est_woba ~ Stuff, data = ff_test)
+
+```
+
+```{r Inter GAM, warning = FALSE, message = FALSE}
+
+gam_formula <- function(data, response_var) {
+  explanatory_vars <- setdiff(names(data), response_var)
+  formula_str <- paste(response_var, " ~ ", paste(explanatory_vars, collapse = " + "))
+  formula <- as.formula(formula_str)
+  return(formula)
+}
+
+
+si_model_gam1 <- gam(gam_formula(si_test, "est_woba"), data = si_test_gam, 
+                     family = gaussian, method = "REML")
+
+sl_model_gam1 <- gam(gam_formula(sl_test, "est_woba"), data = sl_test_gam, 
+                     family = gaussian, method = "REML")
+
+cu_model_gam1 <- gam(gam_formula(cu_test, "est_woba"), data = cu_test_gam, 
+                     family = gaussian, method = "REML")
+
+ch_model_gam1 <- gam(gam_formula(ch_test, "est_woba"), data = ch_test_gam, 
+                     family = gaussian, method = "REML")
+
+fc_model_gam1 <- gam(gam_formula(fc_test, "est_woba"), data = fc_test_gam, 
+                     family = gaussian, method = "REML")
+
+ff_model_gam1 <- gam(gam_formula(ff_test, "est_woba"), data = ff_test_gam, 
+                     family = gaussian, method = "REML")
+
+```
+```{r Intra GAM}
+
+si_model_gam2 <- gam(est_woba ~ Stuff, data = si_test, 
+                     family = gaussian, method = "REML")
+
+sl_model_gam2 <- gam(est_woba ~ Stuff, data = sl_test, 
+                     family = gaussian, method = "REML")
+
+cu_model_gam2 <- gam(est_woba ~ Stuff, data = cu_test, 
+                     family = gaussian, method = "REML")
+
+ch_model_gam2 <- gam(est_woba ~ Stuff, data = ch_test, 
+                     family = gaussian, method = "REML")
+
+fc_model_gam2 <- gam(est_woba ~ Stuff, data = fc_test, 
+                     family = gaussian, method = "REML")
+
+ff_model_gam2 <- gam(est_woba ~ Stuff, data = ff_test, 
+                     family = gaussian, method = "REML")
+
+```
+
+```{r predictions 2023, warning = FALSE, message = FALSE}
+# Sinker
+SI <- si_2023 %>% 
+  mutate(RF1 = predict(si_model, si_2023)$predictions,
+         RF2 = predict(si_model_rf2, si_2023)$predictions,
+         GAM1 = predict(si_model_gam1, si_2023),
+         GAM2 = predict(si_model_gam2, si_2023),
+         mean = mean(est_woba)) %>% 
+  rename(observed = est_woba) %>% 
+  select(observed, RF1, RF2, GAM1, GAM2, mean)
+
+
+# Slider
+SL <- sl_2023 %>% 
+  mutate(RF1 = predict(sl_model, sl_2023)$predictions,
+         RF2 = predict(sl_model_rf2, sl_2023)$predictions,
+         GAM1 = predict(sl_model_gam1, sl_2023),
+         GAM2 = predict(sl_model_gam2, sl_2023),
+         mean = mean(est_woba)) %>% 
+  rename(observed = est_woba) %>% 
+  select(observed, RF1, RF2, GAM1, GAM2, mean)
+
+
+# Curveball
+CU <- cu_2023 %>% 
+  mutate(RF1 = predict(cu_model, cu_2023)$predictions,
+         RF2 = predict(cu_model_rf2, cu_2023)$predictions,
+         GAM1 = predict(cu_model_gam1, cu_2023),
+         GAM2 = predict(cu_model_gam2, cu_2023),
+         mean = mean(est_woba)) %>% 
+  rename(observed = est_woba) %>% 
+  select(observed, RF1, RF2, GAM1, GAM2, mean)
+
+
+# Change-Up
+CH <- ch_2023 %>% 
+  mutate(RF1 = predict(ch_model, ch_2023)$predictions,
+         RF2 = predict(ch_model_rf2, ch_2023)$predictions,
+         GAM1 = predict(ch_model_gam1, ch_2023),
+         GAM2 = predict(ch_model_gam2, ch_2023),
+         mean = mean(est_woba)) %>% 
+  rename(observed = est_woba) %>% 
+  select(observed, RF1, RF2, GAM1, GAM2, mean)
+
+
+# Cutter
+FC <- fc_2023 %>% 
+  mutate(RF1 = predict(fc_model, fc_2023)$predictions,
+         RF2 = predict(fc_model_rf2, fc_2023)$predictions,
+         GAM1 = predict(fc_model_gam1, fc_2023),
+         GAM2 = predict(fc_model_gam2, fc_2023),
+         mean = mean(est_woba)) %>% 
+  rename(observed = est_woba) %>% 
+  select(observed, RF1, RF2, GAM1, GAM2, mean)
+
+
+# Fastball
+FF <- ff_2023 %>% 
+  mutate(RF1 = predict(ff_model, ff_2023)$predictions,
+         RF2 = predict(ff_model_rf2, ff_2023)$predictions,
+         GAM1 = predict(ff_model_gam1, ff_2023),
+         GAM2 = predict(ff_model_gam2, ff_2023),
+         mean = mean(est_woba)) %>% 
+  rename(observed = est_woba) %>% 
+  select(observed, RF1, RF2, GAM1, GAM2, mean)
+
+# RMSEs Inter RF
+rmse_1_si <- rmse(SI$observed, SI$RF1)
+rmse_1_sl <- rmse(SL$observed, SL$RF1)
+rmse_1_cu <- rmse(CU$observed, CU$RF1)
+rmse_1_ch <- rmse(CH$observed, CH$RF1)
+rmse_1_fc <- rmse(FC$observed, FC$RF1)
+rmse_1_ff <- rmse(FF$observed, FF$RF1)
+
+# RMSEs Intra RF
+rmse_2_si <- rmse(SI$observed, SI$RF2)
+rmse_2_sl <- rmse(SL$observed, SL$RF2)
+rmse_2_cu <- rmse(CU$observed, CU$RF2)
+rmse_2_ch <- rmse(CH$observed, CH$RF2)
+rmse_2_fc <- rmse(FC$observed, FC$RF2)
+rmse_2_ff <- rmse(FF$observed, FF$RF2)
+
+# RMSEs Inter GAM
+rmse_3_si <- rmse(SI$observed, SI$GAM1)
+rmse_3_sl <- rmse(SL$observed, SL$GAM1)
+rmse_3_cu <- rmse(CU$observed, CU$GAM1)
+rmse_3_ch <- rmse(CH$observed, CH$GAM1)
+rmse_3_fc <- rmse(FC$observed, FC$GAM1)
+rmse_3_ff <- rmse(FF$observed, FF$GAM1)
+
+# RMSEs Intra GAM
+rmse_4_si <- rmse(SI$observed, SI$GAM2)
+rmse_4_sl <- rmse(SL$observed, SL$GAM2)
+rmse_4_cu <- rmse(CU$observed, CU$GAM2)
+rmse_4_ch <- rmse(CH$observed, CH$GAM2)
+rmse_4_fc <- rmse(FC$observed, FC$GAM2)
+rmse_4_ff <- rmse(FF$observed, FF$GAM2)
+
+# RMSEs Intercept
+rmse_5_si <- rmse(SI$observed, SI$mean)
+rmse_5_sl <- rmse(SL$observed, SL$mean)
+rmse_5_cu <- rmse(CU$observed, CU$mean)
+rmse_5_ch <- rmse(CH$observed, CH$mean)
+rmse_5_fc <- rmse(FC$observed, FC$mean)
+rmse_5_ff <- rmse(FF$observed, FF$mean)
+```
+
+
+```{r RMSEs}
+RMSEs <- data.frame("Pitch" = c("Cutter", "Slider", "4-Seam", 
+                                "Sinker", "Curveball", "Change-Up"),
+                    
+                    "Inter RF" = c(rmse_1_fc, rmse_1_sl, rmse_1_ff,
+                                   rmse_1_si, rmse_1_cu, rmse_1_ch),
+                    
+                    "Intra RF" = c(rmse_2_fc, rmse_2_sl, rmse_2_ff,
+                                   rmse_2_si, rmse_2_cu, rmse_2_ch),
+                    
+                    "Inter GAM" = c(rmse_3_fc, rmse_3_sl, rmse_3_ff,
+                                   rmse_3_si, rmse_3_cu, rmse_3_ch),
+                    
+                    "Intra GAM" = c(rmse_4_fc, rmse_4_sl, rmse_4_ff,
+                                   rmse_4_si, rmse_4_cu, rmse_4_ch),
+                    
+                    "Intercept Only" = c(rmse_5_fc, rmse_5_sl, rmse_5_ff,
+                                   rmse_5_si, rmse_5_cu, rmse_5_ch)
+                    )
+
+RMSEs %>% 
+  kable()
+```
+

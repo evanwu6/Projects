@@ -1,0 +1,60 @@
+---
+title: "Create-New-Data"
+author: "Ethan Park"
+date: "2023-07-28"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+source("Data.R")
+```
+
+```{r}
+# file_path = './Ethan-Data/Inter-Pitch/FF_interpitch_2020-2022.csv'
+# df <- read.csv(file_path)
+# result <- inner_join(df, Data2, by = c("mlbAM_ID" = "pitcher_id", "Year"="year"))
+# 
+# result <- result %>% 
+#   filter(pitch_type == "FF")
+# 
+# final <- select(result, setdiff(names(df), names(Data2)))
+# final <- left_join(final, df %>% select(mlbAM_ID, Year, Stuff, est_woba), 
+#                    by = c("mlbAM_ID", "Year"))
+# final
+# 
+# 
+# 
+
+Data2 <- Data2 %>% 
+  mutate(pitch_type = str_replace(pitch_type, "FS", "CH"))
+
+for (pitch_type_val in pitch_types) {
+  print(pitch_type_val)
+  file_path <- sprintf('./Ethan-Data/Inter-Pitch/%s_interpitch_2020-2022.csv', pitch_type_val)
+  df <- read.csv(file_path)
+
+  result <- inner_join(df, Data2, by = c("mlbAM_ID" = "pitcher_id", "Year" = "year"))
+
+  result <- result %>%
+    filter(pitch_type == pitch_type_val)
+  
+  print(result)
+  final <- select(result, setdiff(names(df), names(Data2)))
+  final <- left_join(final, df %>% select(mlbAM_ID, Year, Stuff, est_woba), 
+                     by = c("mlbAM_ID", "Year"))
+
+  final <- remove_outliers(final, col_names = c('est_woba', 'Stuff'))
+  # final <- as.data.frame(lapply(df, mean_impute))
+  
+  write.csv(final, file = sprintf("%s_interpitch_2020-2022-2.csv", pitch_type_val), row.names = FALSE)
+
+  inters[[pitch_type_val]] <- final
+}
+```
+
+

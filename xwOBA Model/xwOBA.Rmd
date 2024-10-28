@@ -1,0 +1,351 @@
+
+```{r Libraries}
+library(tidyverse)
+library(patchwork)
+library(knitr)
+library(scales)
+library(lubridate)
+```
+
+
+```{r Elements}
+all_data <- read_csv(paste0("Full CSVs/Full_Data.csv"))
+
+AD <- all_data
+
+all_data <- all_data %>% 
+  filter(!(PitchCall %in% c("FoulBall", "FoulBallNotFieldable", "FoulBallFieldable")))
+
+# Barrel Function
+is.barrel <- function(LA, EV){
+  upper <- 1.11*EV - 78.89
+  lower <- -EV + 124
+  outcome <- (LA >= lower) & (LA <= upper) & (EV >= 98) & (LA >= 8) & (LA <= 50)
+  outcome <- replace_na(outcome, FALSE)
+  outcome
+}
+
+
+
+# ggplot Functions
+geom_zone <- function(top = 11/3, bottom = 3/2, linecolor = "black"){
+  geom_rect(xmin = -.7083, xmax = .7083, ymin = bottom, ymax = top,
+            alpha = 0, color = linecolor, linewidth = 0.75)
+}
+
+
+geom_plate <- function(pov = "pitcher"){
+  df <- case_when(
+    pov == "pitcher" ~ 
+      data.frame(x = c(-.7083, .7083, .7083 ,0, -.7083), y = c(0, 0, .25, .5, .25)),
+    pov == "catcher" ~ 
+      data.frame(x = c(-.7083, .7083, .7083 ,0, -.7083), y = c(0, 0, -.25, -.5, -.25)))
+  g <- geom_polygon(data = df, aes(x = x, y = y), fill = "white", color = "black", linewidth = 1)
+  g
+}
+
+# Radians
+rad <- function(degrees) {
+  radians <- degrees * (pi / 180)
+  return(radians)
+}
+
+```
+
+
+
+```{r xwOBA Table, message = FALSE}
+
+D1 <- all_data %>% 
+  filter(Level == "D1",
+         !is.na(ExitSpeed), !is.na(Angle)) %>% 
+  mutate(Outcome = case_when(PlayResult %in% c("Single", "Double", "Triple", "HomeRun") ~ PlayResult,
+                             PlayResult  %in%  c("Out", "FieldersChoice", "Error", "Sacrifice") ~ "Out",
+                             KorBB == "Strikeout" ~ "Out",
+                             KorBB == "Walk" ~ "Walk",
+                             PitchCall == "HitByPitch" ~ "HBP",
+                             TRUE ~ "Undefined")) %>% 
+  mutate(ExitSpeed = case_when(ExitSpeed > 115 ~ 115,
+                               ExitSpeed < 10 ~ 10,
+                               ExitSpeed <= 115 & ExitSpeed >= 10 ~ ExitSpeed),
+         Angle = case_when(Angle > 80 ~ 80,
+                           Angle < -80 ~ -80,
+                           Angle <= 80 & Angle >= -80 ~ Angle))
+
+table <- expand.grid(EV = seq(10, 115, 1),
+                     LA = seq(-80, 80, 1)) %>%
+  as.data.frame() %>%
+  mutate(Single = NA,
+         Double = NA,
+         Triple = NA,
+         HomeRun = NA,
+         Out = NA,
+         Walk = NA,
+         HBP = NA,
+         PA = NA)
+  
+
+for(i in 10:115){
+  for(k in -80:80){
+  
+  EV <- i
+  LA <- k
+  
+  data <- D1 %>% 
+    filter(ExitSpeed >= (i-2), ExitSpeed <= (i+2)) %>% 
+    filter(Angle >= (k-2), Angle <= (k+2))
+  
+  output <- data %>% 
+    summarize(Single = sum(Outcome == "Single"),
+              Double = sum(Outcome == "Double"),
+              Triple = sum(Outcome == "Triple"),
+              HomeRun = sum(Outcome == "HomeRun"),
+              Out = sum(Outcome == "Out"),
+              Walk = sum(Outcome == "Walk"),
+              HBP = sum(Outcome == "HBP"),
+              PA = n())
+  
+  # table[EV = i, LA = k]$Single = output$Single
+  # table[EV = i, LA = k]$Double = output$Double
+  # table[EV = i, LA = k]$Triple = output$Triple
+  # table[EV = i, LA = k]$HomeRun = output$HomeRun
+  # table[EV = i, LA = k]$Out = output$Out
+  # table[EV = i, LA = k]$Walk = output$Walk
+  # table[EV = i, LA = k]$HBP = output$HBP
+  # table[EV = i, LA = k]$PA = output$PA
+  
+  table <- table %>%
+      mutate(Single = ifelse(EV == i & LA == k, output$Single, Single),
+             Double = ifelse(EV == i & LA == k, output$Double, Double),
+             Triple = ifelse(EV == i & LA == k, output$Triple, Triple),
+             HomeRun = ifelse(EV == i & LA == k, output$HomeRun, HomeRun),
+             Out = ifelse(EV == i & LA == k, output$Out, Out),
+             Walk = ifelse(EV == i & LA == k, output$Walk, Walk),
+             HBP = ifelse(EV == i & LA == k, output$HBP, HBP),
+             PA = ifelse(EV == i & LA == k, output$PA, PA))
+  
+  }
+}
+
+wOBA <- table %>% 
+  rowwise() %>% 
+  mutate(PA = sum(Single, Double, Triple, HomeRun, Out, Walk, HBP, na.rm = TRUE)) %>% 
+  filter(!is.na(PA), PA != 0) %>% 
+  rowwise() %>% 
+  mutate(Single = Single/PA,
+         Double = Double/PA,
+         Triple = Triple/PA,
+         HomeRun = HomeRun/PA,
+         Out = Out/PA,
+         Walk = Walk/PA,
+         HBP = HBP/PA) %>% 
+  filter(PA >= 15) %>% 
+  rowwise() %>% 
+  mutate(wOBA = sum(
+    0.69*Walk,
+    0.72*HBP,
+    0.89*Single,
+    1.27*Double,
+    1.62*Triple,
+    2.10*HomeRun
+    ))
+
+# # Write wOBA Prediction CSV
+# wOBA %>% 
+#   rename(ExitSpeed = EV,
+#          Angle = LA,
+#          xwOBA = wOBA) %>% 
+#   mutate(xwOBA = round(xwOBA, 5)) %>% 
+#   select(ExitSpeed, Angle, xwOBA) %>% 
+#   write.csv("xwOBA.csv", row.names = FALSE)
+
+```
+
+
+```{r}
+Div1 <- all_data %>% 
+  filter(Level == "D1")
+
+```
+
+
+```{r}
+  
+xwOBA <- read_csv("xwOBA.csv")
+
+
+# Pitcher
+
+D1xwOBA_h <- D1 %>% 
+  mutate(Outcome = case_when(PlayResult != "Undefined" ~ "BattedBall",
+                             KorBB == "Walk" ~ "Walk",
+                             PitchCall == "HBP" ~ "HBP",
+                             KorBB == "Strikeout" ~ "Strikeout",
+                             TRUE ~ "Undefined")) %>% 
+  filter(Outcome != "Undefined") %>% 
+  select(Batter, Outcome, TaggedHitType, PlayResult, ExitSpeed, Angle) %>% 
+  mutate(EV = round(ExitSpeed),
+         LA = round(Angle)) %>% 
+  left_join(xwOBA,
+            join_by("EV" == "ExitSpeed", "LA" == "Angle")) %>% 
+  mutate(xwOBA = case_when(Outcome == "Walk" ~ 0.69,
+                           Outcome == "HBP" ~ 0.72,
+                           Outcome == "Strikeout" ~ 0,
+                           TRUE ~ xwOBA)) %>% 
+  filter(!is.na(xwOBA)) %>% 
+  group_by(Batter) %>% 
+  summarize(PA = n(), 
+            xwOBA = mean(xwOBA, na.rm = TRUE)) %>% 
+  mutate(xwOBA = round(xwOBA, 4)) %>% 
+  filter(PA >= 90) %>%
+  arrange(desc(xwOBA))
+
+D1xwOBA_h %>% 
+  ggplot() +
+  geom_histogram(aes(x = xwOBA, fill = ..x..),
+                 color = "white",
+                 binwidth = 0.010, show.legend = FALSE) +
+  scale_fill_gradientn(
+    colors = c('blue', 'white', 'red'), 
+    values = scales::rescale(c(0.2, median(D1xwOBA_h$xwOBA, na.rm = TRUE), 0.575))) +
+  labs(title = "D1 Batter 2024 xwOBA",
+       x = "xwOBA",
+       y = "") +
+  theme_dark()
+
+
+# Pitcher
+
+D1xwOBA_p <- D1 %>% 
+  mutate(Outcome = case_when(PlayResult != "Undefined" ~ "BattedBall",
+                             KorBB == "Walk" ~ "Walk",
+                             PitchCall == "HBP" ~ "HBP",
+                             KorBB == "Strikeout" ~ "Strikeout",
+                             TRUE ~ "Undefined")) %>% 
+  filter(Outcome != "Undefined") %>% 
+  select(Pitcher, Outcome, TaggedHitType, PlayResult, ExitSpeed, Angle) %>% 
+  mutate(EV = round(ExitSpeed),
+         LA = round(Angle)) %>% 
+  left_join(xwOBA,
+            join_by("EV" == "ExitSpeed", "LA" == "Angle")) %>% 
+  mutate(xwOBA = case_when(Outcome == "Walk" ~ 0.69,
+                           Outcome == "HBP" ~ 0.72,
+                           Outcome == "Strikeout" ~ 0,
+                           TRUE ~ xwOBA)) %>% 
+  filter(!is.na(xwOBA)) %>% 
+  group_by(Pitcher) %>% 
+  summarize(PA = n(), 
+            xwOBA = mean(xwOBA, na.rm = TRUE)) %>% 
+  mutate(xwOBA = round(xwOBA, 4)) %>% 
+  filter(PA >= 100) %>%
+  arrange(desc(xwOBA))
+
+D1xwOBA_p %>% 
+  ggplot() +
+  geom_histogram(aes(x = xwOBA, fill = ..x..),
+                 color = "white",
+                 binwidth = 0.010, show.legend = FALSE) +
+  scale_fill_gradientn(
+    colors = c('blue', 'white', 'red'), 
+    values = scales::rescale(c(0.2, median(D1xwOBA_p$xwOBA, na.rm = TRUE), 0.575))) +
+  labs(title = "D1 Pitcher 2024 xwOBA",
+       x = "xwOBA",
+       y = "") +
+  theme_dark()
+
+
+# Percentile
+D1_xwOBA <- data.frame(Percentile = 0:100,
+                          Pitcher_xwOBA = 0:100,
+                          Batter_xwOBA = 0:100) %>% 
+  mutate(Pitcher_xwOBA = 0,
+         Batter_xwOBA = 0)
+
+for(i in seq(0, 100, 1)){
+D1_xwOBA$Percentile[i] <- i
+D1_xwOBA$Pitcher_xwOBA[i] <- quantile(D1xwOBA_p$xwOBA, i/100)
+}
+
+for(i in seq(0, 100, 1)){
+D1_xwOBA$Percentile[i] <- i
+D1_xwOBA$Batter_xwOBA[i] <- quantile(D1xwOBA_h$xwOBA, i/100)
+}
+
+
+
+D1_xwOBA <- D1_xwOBA %>% 
+  mutate(Percentile = ifelse(Pitcher_xwOBA + Batter_xwOBA > 0, Percentile, 0),
+         Pitcher_xwOBA = ifelse(Pitcher_xwOBA > 0, Pitcher_xwOBA, quantile(D1xwOBA_p$xwOBA, 0)),
+         Batter_xwOBA = ifelse(Batter_xwOBA > 0, Batter_xwOBA, quantile(D1xwOBA_h$xwOBA, 0)))
+
+write.csv(D1_xwOBA, "xwOBA_Percentiles.csv", row.names = FALSE)
+
+
+
+
+```
+
+```{r}
+
+xwOBAj <- xwOBA %>% 
+  rename(rExitSpeed = ExitSpeed,
+         rAngle = Angle)
+
+D1_P <- Div1 %>% 
+  mutate(Outcome = case_when(PlayResult %in% c("Single", "Double", "Triple", "HomeRun") ~ PlayResult,
+                             PlayResult  %in%  c("Out", "FieldersChoice", "Error", "Sacrifice") ~ "Out",
+                             KorBB == "Strikeout" ~ "Out",
+                             KorBB == "Walk" ~ "Walk",
+                             PitchCall == "HitByPitch" ~ "HBP",
+                             TRUE ~ "Undefined")) %>% 
+  mutate(rExitSpeed = round(ExitSpeed, 0),
+         rAngle = round(Angle, 0)) %>% 
+  left_join(xwOBAj, by = c("rExitSpeed", "rAngle")) %>% 
+  mutate(xwOBA = ifelse(KorBB == "Walk", 0.69, xwOBA),
+         xwOBA = ifelse(PitchCall == "HitByPitch", 0.72, xwOBA),
+         xwOBA = ifelse(KorBB == "Strikeout", 0, xwOBA),
+         wOBA = case_when(Outcome == "Out" ~ 0,
+                          PlayResult == "Single" ~ 0.89,
+                          PlayResult == "Double" ~ 1.27,
+                          PlayResult == "Triple" ~ 1.62,
+                          PlayResult == "HomeRun" ~ 2.10,
+                          PitchCall == "HitByPitch" ~ 0.72,
+                          KorBB == "Walk" ~ 0.69,
+                          KorBB == "Strikeout" ~ 0)) %>% 
+  filter(Outcome != "Undefined") %>% 
+  filter(!is.na(xwOBA))
+
+
+D1_Po <- D1_P %>% 
+  group_by(Pitcher, GameID, Date) %>% 
+  summarize("Batters Faced" = n(), 
+            wOBA = mean(wOBA, na.rm = TRUE),
+            xwOBA = mean(xwOBA, na.rm = TRUE)) %>% 
+  ungroup() %>% 
+  select(-GameID) %>% 
+  filter(`Batters Faced` >= 3)
+
+
+# Percentile
+D1_Po_perc <- data.frame(Percentile = 0:100,
+                          xwOBA = 0:100,
+                          wOBA = 0:100) %>% 
+  mutate(xwOBA = 0,
+         wOBA = 0)
+
+for(i in seq(0, 100, 1)){
+D1_Po_perc$Percentile[i] <- i
+D1_Po_perc$xwOBA[i] <- quantile(D1_Po$xwOBA, i/100)
+}
+
+for(i in seq(0, 100, 1)){
+D1_Po_perc$wOBA[i] <- quantile(D1_Po$wOBA, i/100)
+}
+
+D1_Po_perc <- D1_Po_perc %>% 
+  head(100) %>% 
+  mutate(Percentile = 101 - Percentile)
+
+# write.csv(D1_Po_perc, "Outing Percentiles.csv")
+```
+

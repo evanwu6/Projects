@@ -1,0 +1,901 @@
+---
+title: "SABR Project"
+author: "Evan Wu"
+output: html_document
+---
+
+```{r Libraries, include = FALSE}
+library(tidyverse)
+library(ranger)
+library(vip)
+library(readxl)
+library(Metrics)
+
+options(scipen = 999)
+
+set.seed(48310)
+```
+
+```{r Data, include = FALSE}
+# Raw CSV
+data <- read_csv("Full2023.csv")
+
+# Adding Bases & Runs Scored
+data <- data %>% 
+  mutate(on_1b = ifelse(on_1b > 0, 1, 0),
+         on_2b = ifelse(on_2b > 0, 1, 0),
+         on_3b = ifelse(on_3b > 0, 1, 0)) %>% 
+  mutate(on_1b = replace_na(on_1b, 0),
+         on_2b = replace_na(on_2b, 0),
+         on_3b = replace_na(on_3b, 0)) %>% 
+  mutate(bases = paste0(on_1b, "_", on_2b, "_", on_3b)) %>% 
+  mutate(bases = as.factor(bases)) %>% 
+  filter(!is.na(plate_x),
+         !is.na(plate_z),
+         !is.na(pitch_type)) %>% 
+  mutate(runs_scored = post_bat_score - bat_score)
+
+# Adding Pitcher/Batter Matchup Variable
+data <- data %>% 
+  mutate(handedness = paste0(p_throws, "_", stand))
+
+# Adding Count Variable
+data <- data %>% 
+  mutate(count = paste0(balls, "_", strikes)) %>% 
+  mutate(count = as.factor(count))
+
+# Removing Pitchouts
+data <- data %>% 
+  filter(description != "pitchout")
+
+# Removing Observations with no delta run expectancy (8)
+data <- data %>% 
+  filter(!is.na(delta_run_exp))
+
+# Adding Foul Indicator
+
+data <- data %>% 
+  mutate(foul = ifelse(description == "foul", 1, 0)) %>% 
+  mutate(foul = as.factor(foul))
+
+```
+
+```{r}
+# Classifying Outcomes
+data <- data %>% 
+  mutate(outcome = case_when(
+    description == "foul" ~ "FOUL",
+    description  %in% c("called_strike", "ball", "blocked_ball",
+                             "hit_by_pitch") ~ "TAKE",
+    description  %in% c("swinging_strike", "foul_tip", 
+                             "swinging_strike_blocked", "foul_bunt", 
+                             "missed_bunt", "bunt_foul_tip", 
+                             "hit_into_play") ~ "SWING"
+  ))
+
+```
+
+
+```{r Foul Model, echo = FALSE, warning = FALSE, message = FALSE}
+# Model
+
+foul_data <- data %>% 
+  filter(outcome == "FOUL")
+
+runs_model_foul <- ranger(delta_run_exp ~ release_speed + plate_x + plate_z + 
+                         pfx_x + pfx_z + count + bases,
+                         importance = "impurity",
+                       data = foul_data)
+
+
+# Variable Importance
+vip(runs_model_foul,
+    geom = "col",
+    importance = "impurity",
+    aesthetics = list(color = "white", fill = "steelblue")) + 
+  labs(title = "Initial Model for Runs Scored") +
+       theme_bw()
+
+```
+
+```{r, Pitch Reclassification}
+data <- data %>% 
+  mutate(pitch_type = str_replace(pitch_type, "KC", "CU"),
+         pitch_name = str_replace(pitch_name, "Knuckle Curve", "Curveball"),
+         pitch_type = str_replace(pitch_type, "CS", "CU"),
+         pitch_name = str_replace(pitch_name, "Slow Curve", "Curveball"),
+         pitch_type = str_replace(pitch_type, "FO", "FS"),
+         pitch_name = str_replace(pitch_name, "Forkball", "Split-Finger")) %>% 
+  filter(pitch_type != "FA",
+         pitch_type != "EP")
+
+# Knuckle Curve -> Curveball
+# Slow Curve -> Curveball
+# Forkball -> Split-Finger
+# REMOVED Position Player Pitching (FA/Other + EP/Eephus)
+
+
+```
+
+
+```{r Takes Model, echo = FALSE, warning = FALSE, message = FALSE}
+# Model
+take_data <- data %>% 
+  filter(outcome == "TAKE")
+
+runs_model_take <- ranger(delta_run_exp ~ release_speed + plate_x + plate_z + 
+                         pfx_x + pfx_z + count + bases,
+                         importance = "impurity",
+                       data = take_data)
+
+
+# Variable Importance
+vip(runs_model_take,
+    geom = "col",
+    importance = "impurity",
+    aesthetics = list(color = "white", fill = "steelblue")) + 
+  labs(title = "Initial Model for Runs Scored") +
+       theme_bw()
+
+
+```
+
+
+```{r Swings Model, echo = FALSE, warning = FALSE, message = FALSE}
+# Model
+swing_data <- data %>% 
+  filter(outcome == "SWING")
+
+runs_model_swing <- ranger(delta_run_exp ~ release_speed + plate_x + plate_z + 
+                         pfx_x + pfx_z + count + bases,
+                         importance = "impurity",
+                       data = swing_data)
+
+# Variable Importance
+vip(runs_model_swing,
+    geom = "col",
+    importance = "impurity",
+    aesthetics = list(color = "white", fill = "steelblue")) + 
+  labs(title = "Initial Model for Runs Scored") +
+       theme_bw()
+
+
+```
+
+
+``` {r Combining Model Outputs}
+# Pitch Proportions
+pitch_props <- data %>% 
+  group_by(pitch_type, stand, zone, outcome) %>% 
+  summarize(n = n()) %>% 
+  pivot_wider(names_from = "outcome",
+              values_from = "n") %>% 
+  mutate(swing_prop = SWING/(SWING+TAKE),
+         take_prop = TAKE/(SWING+TAKE)) %>% 
+  select(pitch_type, stand, zone, swing_prop, take_prop)
+
+
+test_results <- data %>% 
+  filter(!is.na(release_speed), !is.na(plate_x), !is.na(plate_z)) %>% 
+  mutate(foul_preds = predict(runs_model_foul, data)$predictions) %>% 
+  mutate(take_preds = predict(runs_model_take, data)$predictions) %>% 
+  mutate(swing_preds = predict(runs_model_swing, data)$predictions) %>% 
+  left_join(pitch_props, join_by(pitch_type, stand, zone)) %>% 
+  mutate(F_Runs = (foul_preds - take_preds - swing_preds)*100)
+  
+  
+test_results %>% 
+  ggplot(aes(x = delta_run_exp, y = F_Runs, color = foul)) +
+  geom_point(alpha = 0.1, size = 0.25) + 
+  coord_fixed() +
+  facet_wrap(~ foul,
+             ncol = 1)
+
+test_results %>% 
+  mutate(F_Runs_Clusters = round(F_Runs, 0)) %>% 
+  ggplot(aes(x = F_Runs_Clusters)) +
+  geom_histogram(fill = "black", fill = "black", binwidth = 1) +
+  facet_wrap(~ pitch_type)
+  
+```
+
+
+```{r}
+# F Runs by Inning
+test_results %>% 
+  mutate(inning = case_when(inning > 9 ~ 10,
+         inning <= 9 ~ inning)) %>% 
+  group_by(inning) %>% 
+  summarize(pitches = n(),
+            average_re = round(mean(F_Runs), 1)) %>% 
+  mutate(inning_value = inning) %>% 
+  mutate(inning = as.factor(inning),
+         inning = fct_reorder(inning, desc(inning_value))) %>% 
+  ggplot(aes(x = average_re, y = inning)) +
+  geom_col(fill = "#B59A57") +
+  scale_y_discrete(labels = c("Extra Innings", "9th Inning", "8th Inning",
+                              "7th Inning", "6th Inning", "5th Inning",
+                              "4th Inning", "3rd Inning", "2nd Inning",
+                              "1st Inning")) +
+  theme_classic() +
+  theme(axis.ticks.y = element_blank(),
+        axis.line.y = element_blank(),
+        axis.line.x = element_blank(), 
+        plot.title = element_text(hjust = 0.5)) +
+  labs(y = "",
+       x = "F Runs",
+       title = "Average F Runs by Inning")
+
+
+# F Runs By Outs
+test_results %>% 
+  group_by(outs_when_up) %>% 
+  summarize(pitches = n(),
+            average_re = round(mean(F_Runs), 2)) %>%
+  mutate(outs = outs_when_up) %>% 
+  mutate(outs_when_up = as.factor(outs_when_up)) %>% 
+  mutate(outs_when_up = fct_reorder(outs_when_up, desc(outs))) %>% 
+ ggplot(aes(x = average_re, y = outs_when_up)) +
+  geom_col(fill = "#B59A57") +
+  theme_classic() +
+  theme(axis.ticks.y = element_blank(),
+        axis.line.y = element_blank(),
+        axis.line.x = element_blank(), 
+        plot.title = element_text(hjust = 0.5)) +
+  scale_y_discrete(labels = c("2 Outs", "1 Outs", "0 Outs")) +
+  labs(y = "",
+       x = "F Runs",
+       title = "Average F Runs by Out")
+
+
+# F Runs By Base State
+test_results %>% 
+  group_by(bases) %>% 
+  summarize(pitches = n(),
+            average_re = round(mean(F_Runs), 2)) %>%
+  mutate(bases = as.factor(bases)) %>% 
+  mutate(bases = as.factor(bases),
+         bases = fct_reorder(bases, desc(average_re))) %>% 
+ ggplot(aes(x = average_re, y = bases)) +
+  geom_col(fill = "#B59A57") +
+  theme_classic() +
+  theme(axis.ticks.y = element_blank(),
+        axis.line.y = element_blank(),
+        axis.line.x = element_blank(), 
+        plot.title = element_text(hjust = 0.5)) +
+  labs(y = "",
+       x = "F Runs",
+       title = "Average F Runs by Base State")
+```
+
+
+```{r Model by Zone}
+
+F_Runs_P_S_Z <- test_results %>% 
+  group_by(pitch_type, handedness, zone) %>% 
+  summarize(F_Runs = mean(F_Runs)) %>% 
+  mutate(zone = as.factor(zone))
+```
+
+``` {r}
+# Zone Graph Placement Data
+zone_data <- data.frame(
+  zone = c(1, 2, 3, 4, 5, 6, 7, 8, 9),
+  x = c(-0.7083, 0, 0.7083, -0.7083, 0, 0.7083, -0.7083, 0, 0.7083),
+  y = c(-0.7083, -0.7083, -0.7083, 0, 0, 0, 0.7083, 0.7083, 0.7083)
+) %>% 
+  mutate(zone = as.factor(zone))
+
+extra_zones <- data.frame(
+  zone = c(11, 12, 13, 14),
+  x = c(-0.7083, 0.7083, -0.7083, 0.7083),
+  y = c(0.7083, 0.7083, -0.7083, -0.7083)
+) %>% 
+  mutate(zone = as.factor(zone))
+
+full_zone_data <- rbind(zone_data, extra_zones)
+
+
+
+loc_g <- F_Runs_P_S_Z %>% 
+  left_join(full_zone_data, join_by(zone)) %>%
+  filter(zone  %in% seq(1, 14, 1)) %>% 
+  filter(pitch_type != "SC", pitch_type != "KN") %>% 
+  mutate(F_Runs_Col = case_when(F_Runs <= 5 & F_Runs >= -5 ~ F_Runs,
+                                F_Runs > 5 ~ 5,
+                                F_Runs < 5~ -5))
+
+# All Pitches
+loc_g_extra <- loc_g %>% 
+  filter(zone %in% 11:14) %>% 
+  mutate(x = ifelse(x > 0, x + 0.5, x - 0.5),
+         y = ifelse(y > 0, y + 0.5, y - 0.5))
+
+ggplot() +
+  geom_rect(data = loc_g %>% filter(zone  %in% 11:14),
+            aes(xmin = x - 0.75, xmax = x + 0.75, ymin = y - 0.75, ymax = y + 0.75,
+                fill = F_Runs_Col), color = "black", size = 0.5, show.legend = FALSE) +
+  geom_text(data = loc_g_extra,
+            aes(x = x, y = y, label = round(F_Runs, 2)),
+            color = "black", size = 0.65, show.legend = FALSE) +
+  geom_tile(data = loc_g %>% filter(zone %in% 1:9),
+            aes(x = x, y = y, fill = F_Runs_Col),
+            color = "black", size = 0.25, show.legend = FALSE) +
+  geom_text(data = loc_g %>% filter(zone %in% 1:9),
+            aes(x = x, y = y, label = round(F_Runs, 2)),
+            color = "black", size = 1, show.legend = FALSE) +
+  theme_void() +  # Remove axis and background
+  geom_polygon(data = data.frame(x = c(-0.708, 0.7083, 0.7083, 0, -0.7083),
+                                 y = c(-2, -2, -2.25, -2.5, -2.25)), 
+               aes(x = x, y = y), fill = "white", color = "black", size = 0.5) +  # Home plate
+  scale_fill_gradient2(low = "cornflowerblue", midpoint = 0, high = "firebrick",
+                      limits = c(-5, 5)) +
+  coord_fixed() +
+  facet_grid(cols = vars(pitch_type), 
+             rows = vars(handedness)) +
+  theme(strip.text = element_text(size = 5, hjust = 0.5))
+
+
+# Main
+loc_g_main <- loc_g %>% 
+  filter(pitch_type %in% c("FF", "CH", "CU", "SL"),
+         handedness == "R_R")
+
+loc_g_extra_main <- loc_g_extra %>% 
+  filter(pitch_type %in% c("FF", "CH", "CU", "SL"),
+         handedness == "R_R")
+
+
+ggplot() +
+  geom_rect(data = loc_g_main %>% filter(zone  %in% 11:14),
+            aes(xmin = x - 0.75, xmax = x + 0.75, ymin = y - 0.75, ymax = y + 0.75,
+                fill = F_Runs_Col), color = "black", size = 0.5, show.legend = FALSE) +
+  geom_text(data = loc_g_extra_main,
+            aes(x = x, y = y, label = round(F_Runs, 2)),
+            color = "black", size = 1.75, show.legend = FALSE) +
+  geom_tile(data = loc_g_main %>% filter(zone %in% 1:9),
+            aes(x = x, y = y, fill = F_Runs_Col),
+            color = "black", size = 0.25, show.legend = FALSE) +
+  geom_text(data = loc_g_main %>% filter(zone %in% 1:9),
+            aes(x = x, y = y, label = round(F_Runs, 2)),
+            color = "black", size = 2, show.legend = FALSE) +
+  theme_void() +  # Remove axis and background
+  geom_polygon(data = data.frame(x = c(-0.708, 0.7083, 0.7083, 0, -0.7083),
+                                 y = c(-2, -2, -2.25, -2.5, -2.25)), 
+               aes(x = x, y = y), fill = "white", color = "black", size = 0.5) +  # Home plate
+  scale_fill_gradient2(low = "cornflowerblue", midpoint = 0, high = "firebrick",
+                      limits = c(-5, 5)) +
+  coord_fixed() +
+  facet_wrap(~ pitch_type,
+             ncol = 4) +
+  theme(strip.text = element_text(size = 10, hjust = 0.5))
+
+```
+
+```{r Results by Pitch}
+
+############
+# CHANGEUPS
+############
+
+
+loc_g_ch <- F_Runs_P_S_Z %>% 
+  left_join(full_zone_data, join_by(zone)) %>%
+  filter(zone  %in% seq(1, 14, 1)) %>% 
+  filter(pitch_type == "CH") %>% 
+  mutate(F_Runs_Col = case_when(F_Runs <= 5 & F_Runs >= -5 ~ F_Runs,
+                                F_Runs > 5 ~ 5,
+                                F_Runs < 5~ -5))
+
+loc_g_extra_ch <- loc_g_ch %>% 
+  filter(zone %in% 11:14) %>% 
+  mutate(x = ifelse(x > 0, x + 0.5, x - 0.5),
+         y = ifelse(y > 0, y + 0.5, y - 0.5))
+
+ggplot() +
+  geom_rect(data = loc_g_ch %>% filter(zone  %in% 11:14),
+            aes(xmin = x - 0.75, xmax = x + 0.75, ymin = y - 0.75, ymax = y + 0.75,
+                fill = F_Runs_Col), color = "black", size = 0.5, show.legend = FALSE) +
+  geom_text(data = loc_g_extra_ch,
+            aes(x = x, y = y, label = round(F_Runs, 2)),
+            color = "black", size = 1.75, show.legend = FALSE) +
+  geom_tile(data = loc_g_ch %>% filter(zone %in% 1:9),
+            aes(x = x, y = y, fill = F_Runs_Col),
+            color = "black", size = 0.25, show.legend = FALSE) +
+  geom_text(data = loc_g_ch %>% filter(zone %in% 1:9),
+            aes(x = x, y = y, label = round(F_Runs, 2)),
+            color = "black", size = 2, show.legend = FALSE) +
+  theme_void() +  # Remove axis and background
+  geom_polygon(data = data.frame(x = c(-0.708, 0.7083, 0.7083, 0, -0.7083),
+                                 y = c(-2, -2, -2.25, -2.5, -2.25)), 
+               aes(x = x, y = y), fill = "white", color = "black", size = 0.5) +  # Home plate
+  scale_fill_gradient2(low = "cornflowerblue", midpoint = 0, high = "firebrick",
+                      limits = c(-5, 5)) +
+  coord_fixed() +
+  facet_wrap(~ handedness) +
+  labs(title = "Change Up") +
+  theme(strip.text = element_text(size = 5, hjust = 0.5),
+        plot.title = element_text(hjust = 0.5, vjust = 3))
+
+
+
+############
+# Fastballs
+############
+
+
+loc_g_ff <- F_Runs_P_S_Z %>% 
+  left_join(full_zone_data, join_by(zone)) %>%
+  filter(zone  %in% seq(1, 14, 1)) %>% 
+  filter(pitch_type == "FF") %>% 
+  mutate(F_Runs_Col = case_when(F_Runs <= 5 & F_Runs >= -5 ~ F_Runs,
+                                F_Runs > 5 ~ 5,
+                                F_Runs < 5~ -5))
+
+loc_g_extra_ff <- loc_g_ff %>% 
+  filter(zone %in% 11:14) %>% 
+  mutate(x = ifelse(x > 0, x + 0.5, x - 0.5),
+         y = ifelse(y > 0, y + 0.5, y - 0.5))
+
+ggplot() +
+  geom_rect(data = loc_g_ff %>% filter(zone  %in% 11:14),
+            aes(xmin = x - 0.75, xmax = x + 0.75, ymin = y - 0.75, ymax = y + 0.75,
+                fill = F_Runs_Col), color = "black", size = 0.5, show.legend = FALSE) +
+  geom_text(data = loc_g_extra_ff,
+            aes(x = x, y = y, label = round(F_Runs, 2)),
+            color = "black", size = 1.75, show.legend = FALSE) +
+  geom_tile(data = loc_g_ff %>% filter(zone %in% 1:9),
+            aes(x = x, y = y, fill = F_Runs_Col),
+            color = "black", size = 0.25, show.legend = FALSE) +
+  geom_text(data = loc_g_ff %>% filter(zone %in% 1:9),
+            aes(x = x, y = y, label = round(F_Runs, 2)),
+            color = "black", size = 2, show.legend = FALSE) +
+  theme_void() +  # Remove axis and background
+  geom_polygon(data = data.frame(x = c(-0.708, 0.7083, 0.7083, 0, -0.7083),
+                                 y = c(-2, -2, -2.25, -2.5, -2.25)), 
+               aes(x = x, y = y), fill = "white", color = "black", size = 0.5) +  # Home plate
+  scale_fill_gradient2(low = "cornflowerblue", midpoint = 0, high = "firebrick",
+                      limits = c(-5, 5)) +
+  coord_fixed() +
+  facet_wrap(~ handedness) +
+  labs(title = "Fastball") +
+  theme(strip.text = element_text(size = 5, hjust = 0.5),
+        plot.title = element_text(hjust = 0.5, vjust = 3))
+
+
+
+############
+# Sliders
+############
+
+
+loc_g_sl <- F_Runs_P_S_Z %>% 
+  left_join(full_zone_data, join_by(zone)) %>%
+  filter(zone  %in% seq(1, 14, 1)) %>% 
+  filter(pitch_type == "SL") %>% 
+  mutate(F_Runs_Col = case_when(F_Runs <= 5 & F_Runs >= -5 ~ F_Runs,
+                                F_Runs > 5 ~ 5,
+                                F_Runs < 5~ -5))
+
+loc_g_extra_sl <- loc_g_sl %>% 
+  filter(zone %in% 11:14) %>% 
+  mutate(x = ifelse(x > 0, x + 0.5, x - 0.5),
+         y = ifelse(y > 0, y + 0.5, y - 0.5))
+
+ggplot() +
+  geom_rect(data = loc_g_sl %>% filter(zone  %in% 11:14),
+            aes(xmin = x - 0.75, xmax = x + 0.75, ymin = y - 0.75, ymax = y + 0.75,
+                fill = F_Runs_Col), color = "black", size = 0.5, show.legend = FALSE) +
+  geom_text(data = loc_g_extra_sl,
+            aes(x = x, y = y, label = round(F_Runs, 2)),
+            color = "black", size = 1.75, show.legend = FALSE) +
+  geom_tile(data = loc_g_sl %>% filter(zone %in% 1:9),
+            aes(x = x, y = y, fill = F_Runs_Col),
+            color = "black", size = 0.25, show.legend = FALSE) +
+  geom_text(data = loc_g_sl %>% filter(zone %in% 1:9),
+            aes(x = x, y = y, label = round(F_Runs, 2)),
+            color = "black", size = 2, show.legend = FALSE) +
+  theme_void() +  # Remove axis and background
+  geom_polygon(data = data.frame(x = c(-0.708, 0.7083, 0.7083, 0, -0.7083),
+                                 y = c(-2, -2, -2.25, -2.5, -2.25)), 
+               aes(x = x, y = y), fill = "white", color = "black", size = 0.5) +  # Home plate
+  scale_fill_gradient2(low = "cornflowerblue", midpoint = 0, high = "firebrick",
+                      limits = c(-5, 5)) +
+  coord_fixed() +
+  facet_wrap(~ handedness) +
+  labs(title = "Slider") +
+  theme(strip.text = element_text(size = 5, hjust = 0.5),
+        plot.title = element_text(hjust = 0.5, vjust = 3))
+
+
+
+
+############
+# Curveballs
+############
+
+
+loc_g_cu <- F_Runs_P_S_Z %>% 
+  left_join(full_zone_data, join_by(zone)) %>%
+  filter(zone  %in% seq(1, 14, 1)) %>% 
+  filter(pitch_type == "CU") %>% 
+  mutate(F_Runs_Col = case_when(F_Runs <= 5 & F_Runs >= -5 ~ F_Runs,
+                                F_Runs > 5 ~ 5,
+                                F_Runs < 5~ -5))
+
+loc_g_extra_cu <- loc_g_cu %>% 
+  filter(zone %in% 11:14) %>% 
+  mutate(x = ifelse(x > 0, x + 0.5, x - 0.5),
+         y = ifelse(y > 0, y + 0.5, y - 0.5))
+
+ggplot() +
+  geom_rect(data = loc_g_cu %>% filter(zone  %in% 11:14),
+            aes(xmin = x - 0.75, xmax = x + 0.75, ymin = y - 0.75, ymax = y + 0.75,
+                fill = F_Runs_Col), color = "black", size = 0.5, show.legend = FALSE) +
+  geom_text(data = loc_g_extra_cu,
+            aes(x = x, y = y, label = round(F_Runs, 2)),
+            color = "black", size = 1.75, show.legend = FALSE) +
+  geom_tile(data = loc_g_cu %>% filter(zone %in% 1:9),
+            aes(x = x, y = y, fill = F_Runs_Col),
+            color = "black", size = 0.25, show.legend = FALSE) +
+  geom_text(data = loc_g_cu %>% filter(zone %in% 1:9),
+            aes(x = x, y = y, label = round(F_Runs, 2)),
+            color = "black", size = 2, show.legend = FALSE) +
+  theme_void() +  # Remove axis and background
+  geom_polygon(data = data.frame(x = c(-0.708, 0.7083, 0.7083, 0, -0.7083),
+                                 y = c(-2, -2, -2.25, -2.5, -2.25)), 
+               aes(x = x, y = y), fill = "white", color = "black", size = 0.5) +  # Home plate
+  scale_fill_gradient2(low = "cornflowerblue", midpoint = 0, high = "firebrick",
+                      limits = c(-5, 5)) +
+  coord_fixed() +
+  facet_wrap(~ handedness) +
+  labs(title = "Curveball") +
+  theme(strip.text = element_text(size = 5, hjust = 0.5),
+        plot.title = element_text(hjust = 0.5, vjust = 3))
+
+
+############
+# Split-Fingers
+############
+
+
+loc_g_fs <- F_Runs_P_S_Z %>% 
+  left_join(full_zone_data, join_by(zone)) %>%
+  filter(zone  %in% seq(1, 14, 1)) %>% 
+  filter(pitch_type == "FS") %>% 
+  mutate(F_Runs_Col = case_when(F_Runs <= 5 & F_Runs >= -5 ~ F_Runs,
+                                F_Runs > 5 ~ 5,
+                                F_Runs < 5~ -5))
+
+loc_g_extra_fs <- loc_g_fs %>% 
+  filter(zone %in% 11:14) %>% 
+  mutate(x = ifelse(x > 0, x + 0.5, x - 0.5),
+         y = ifelse(y > 0, y + 0.5, y - 0.5))
+
+ggplot() +
+  geom_rect(data = loc_g_fs %>% filter(zone  %in% 11:14),
+            aes(xmin = x - 0.75, xmax = x + 0.75, ymin = y - 0.75, ymax = y + 0.75,
+                fill = F_Runs_Col), color = "black", size = 0.5, show.legend = FALSE) +
+  geom_text(data = loc_g_extra_fs,
+            aes(x = x, y = y, label = round(F_Runs, 2)),
+            color = "black", size = 1.75, show.legend = FALSE) +
+  geom_tile(data = loc_g_fs %>% filter(zone %in% 1:9),
+            aes(x = x, y = y, fill = F_Runs_Col),
+            color = "black", size = 0.25, show.legend = FALSE) +
+  geom_text(data = loc_g_fs %>% filter(zone %in% 1:9),
+            aes(x = x, y = y, label = round(F_Runs, 2)),
+            color = "black", size = 2, show.legend = FALSE) +
+  theme_void() +  # Remove axis and background
+  geom_polygon(data = data.frame(x = c(-0.708, 0.7083, 0.7083, 0, -0.7083),
+                                 y = c(-2, -2, -2.25, -2.5, -2.25)), 
+               aes(x = x, y = y), fill = "white", color = "black", size = 0.5) +  # Home plate
+  scale_fill_gradient2(low = "cornflowerblue", midpoint = 0, high = "firebrick",
+                      limits = c(-5, 5)) +
+  coord_fixed() +
+  facet_wrap(~ handedness) +
+  labs(title = "Split-Finger") +
+  theme(strip.text = element_text(size = 5, hjust = 0.5),
+        plot.title = element_text(hjust = 0.5, vjust = 3))
+
+
+
+
+############
+# Cutters
+############
+
+
+loc_g_fc <- F_Runs_P_S_Z %>% 
+  left_join(full_zone_data, join_by(zone)) %>%
+  filter(zone  %in% seq(1, 14, 1)) %>% 
+  filter(pitch_type == "FC") %>% 
+  mutate(F_Runs_Col = case_when(F_Runs <= 5 & F_Runs >= -5 ~ F_Runs,
+                                F_Runs > 5 ~ 5,
+                                F_Runs < 5~ -5))
+
+loc_g_extra_fc <- loc_g_fc %>% 
+  filter(zone %in% 11:14) %>% 
+  mutate(x = ifelse(x > 0, x + 0.5, x - 0.5),
+         y = ifelse(y > 0, y + 0.5, y - 0.5))
+
+ggplot() +
+  geom_rect(data = loc_g_fc %>% filter(zone  %in% 11:14),
+            aes(xmin = x - 0.75, xmax = x + 0.75, ymin = y - 0.75, ymax = y + 0.75,
+                fill = F_Runs_Col), color = "black", size = 0.5, show.legend = FALSE) +
+  geom_text(data = loc_g_extra_fc,
+            aes(x = x, y = y, label = round(F_Runs, 2)),
+            color = "black", size = 1.75, show.legend = FALSE) +
+  geom_tile(data = loc_g_fc %>% filter(zone %in% 1:9),
+            aes(x = x, y = y, fill = F_Runs_Col),
+            color = "black", size = 0.25, show.legend = FALSE) +
+  geom_text(data = loc_g_fc %>% filter(zone %in% 1:9),
+            aes(x = x, y = y, label = round(F_Runs, 2)),
+            color = "black", size = 2, show.legend = FALSE) +
+  theme_void() +  # Remove axis and background
+  geom_polygon(data = data.frame(x = c(-0.708, 0.7083, 0.7083, 0, -0.7083),
+                                 y = c(-2, -2, -2.25, -2.5, -2.25)), 
+               aes(x = x, y = y), fill = "white", color = "black", size = 0.5) +  # Home plate
+  scale_fill_gradient2(low = "cornflowerblue", midpoint = 0, high = "firebrick",
+                      limits = c(-5, 5)) +
+  coord_fixed() +
+  facet_wrap(~ handedness) +
+  labs(title = "Cutter") +
+  theme(strip.text = element_text(size = 5, hjust = 0.5),
+        plot.title = element_text(hjust = 0.5, vjust = 3))
+
+
+
+
+############
+# Sinkers
+############
+
+
+loc_g_si <- F_Runs_P_S_Z %>% 
+  left_join(full_zone_data, join_by(zone)) %>%
+  filter(zone  %in% seq(1, 14, 1)) %>% 
+  filter(pitch_type == "SI") %>% 
+  mutate(F_Runs_Col = case_when(F_Runs <= 5 & F_Runs >= -5 ~ F_Runs,
+                                F_Runs > 5 ~ 5,
+                                F_Runs < 5~ -5))
+
+loc_g_extra_si <- loc_g_si %>% 
+  filter(zone %in% 11:14) %>% 
+  mutate(x = ifelse(x > 0, x + 0.5, x - 0.5),
+         y = ifelse(y > 0, y + 0.5, y - 0.5))
+
+ggplot() +
+  geom_rect(data = loc_g_si %>% filter(zone  %in% 11:14),
+            aes(xmin = x - 0.75, xmax = x + 0.75, ymin = y - 0.75, ymax = y + 0.75,
+                fill = F_Runs_Col), color = "black", size = 0.5, show.legend = FALSE) +
+  geom_text(data = loc_g_extra_si,
+            aes(x = x, y = y, label = round(F_Runs, 2)),
+            color = "black", size = 1.75, show.legend = FALSE) +
+  geom_tile(data = loc_g_si %>% filter(zone %in% 1:9),
+            aes(x = x, y = y, fill = F_Runs_Col),
+            color = "black", size = 0.25, show.legend = FALSE) +
+  geom_text(data = loc_g_si %>% filter(zone %in% 1:9),
+            aes(x = x, y = y, label = round(F_Runs, 2)),
+            color = "black", size = 2, show.legend = FALSE) +
+  theme_void() +  # Remove axis and background
+  geom_polygon(data = data.frame(x = c(-0.708, 0.7083, 0.7083, 0, -0.7083),
+                                 y = c(-2, -2, -2.25, -2.5, -2.25)), 
+               aes(x = x, y = y), fill = "white", color = "black", size = 0.5) +  # Home plate
+  scale_fill_gradient2(low = "cornflowerblue", midpoint = 0, high = "firebrick",
+                      limits = c(-5, 5)) +
+  coord_fixed() +
+  facet_wrap(~ handedness) +
+  labs(title = "Sinker") +
+  theme(strip.text = element_text(size = 5, hjust = 0.5),
+        plot.title = element_text(hjust = 0.5, vjust = 3))
+
+
+
+
+############
+# Sweepers
+############
+
+
+loc_g_st <- F_Runs_P_S_Z %>% 
+  left_join(full_zone_data, join_by(zone)) %>%
+  filter(zone  %in% seq(1, 14, 1)) %>% 
+  filter(pitch_type == "ST") %>% 
+  mutate(F_Runs_Col = case_when(F_Runs <= 5 & F_Runs >= -5 ~ F_Runs,
+                                F_Runs > 5 ~ 5,
+                                F_Runs < 5~ -5))
+
+loc_g_extra_st <- loc_g_st %>% 
+  filter(zone %in% 11:14) %>% 
+  mutate(x = ifelse(x > 0, x + 0.5, x - 0.5),
+         y = ifelse(y > 0, y + 0.5, y - 0.5))
+
+ggplot() +
+  geom_rect(data = loc_g_st %>% filter(zone  %in% 11:14),
+            aes(xmin = x - 0.75, xmax = x + 0.75, ymin = y - 0.75, ymax = y + 0.75,
+                fill = F_Runs_Col), color = "black", size = 0.5, show.legend = FALSE) +
+  geom_text(data = loc_g_extra_st,
+            aes(x = x, y = y, label = round(F_Runs, 2)),
+            color = "black", size = 1.75, show.legend = FALSE) +
+  geom_tile(data = loc_g_st %>% filter(zone %in% 1:9),
+            aes(x = x, y = y, fill = F_Runs_Col),
+            color = "black", size = 0.25, show.legend = FALSE) +
+  geom_text(data = loc_g_st %>% filter(zone %in% 1:9),
+            aes(x = x, y = y, label = round(F_Runs, 2)),
+            color = "black", size = 2, show.legend = FALSE) +
+  theme_void() +  # Remove axis and background
+  geom_polygon(data = data.frame(x = c(-0.708, 0.7083, 0.7083, 0, -0.7083),
+                                 y = c(-2, -2, -2.25, -2.5, -2.25)), 
+               aes(x = x, y = y), fill = "white", color = "black", size = 0.5) +  # Home plate
+  scale_fill_gradient2(low = "cornflowerblue", midpoint = 0, high = "firebrick",
+                      limits = c(-5, 5)) +
+  coord_fixed() +
+  facet_wrap(~ handedness) +
+  labs(title = "Sweeper") +
+  theme(strip.text = element_text(size = 5, hjust = 0.5),
+        plot.title = element_text(hjust = 0.5, vjust = 3))
+
+
+
+############
+# Slurve
+############
+
+
+loc_g_sv <- F_Runs_P_S_Z %>% 
+  left_join(full_zone_data, join_by(zone)) %>%
+  filter(zone  %in% seq(1, 14, 1)) %>% 
+  filter(pitch_type == "SV") %>% 
+  mutate(F_Runs_Col = case_when(F_Runs <= 5 & F_Runs >= -5 ~ F_Runs,
+                                F_Runs > 5 ~ 5,
+                                F_Runs < 5~ -5))
+
+loc_g_extra_sv <- loc_g_sv %>% 
+  filter(zone %in% 11:14) %>% 
+  mutate(x = ifelse(x > 0, x + 0.5, x - 0.5),
+         y = ifelse(y > 0, y + 0.5, y - 0.5))
+
+ggplot() +
+  geom_rect(data = loc_g_sv %>% filter(zone  %in% 11:14),
+            aes(xmin = x - 0.75, xmax = x + 0.75, ymin = y - 0.75, ymax = y + 0.75,
+                fill = F_Runs_Col), color = "black", size = 0.5, show.legend = FALSE) +
+  geom_text(data = loc_g_extra_sv,
+            aes(x = x, y = y, label = round(F_Runs, 2)),
+            color = "black", size = 1.75, show.legend = FALSE) +
+  geom_tile(data = loc_g_sv %>% filter(zone %in% 1:9),
+            aes(x = x, y = y, fill = F_Runs_Col),
+            color = "black", size = 0.25, show.legend = FALSE) +
+  geom_text(data = loc_g_sv %>% filter(zone %in% 1:9),
+            aes(x = x, y = y, label = round(F_Runs, 2)),
+            color = "black", size = 2, show.legend = FALSE) +
+  theme_void() +  # Remove axis and background
+  geom_polygon(data = data.frame(x = c(-0.708, 0.7083, 0.7083, 0, -0.7083),
+                                 y = c(-2, -2, -2.25, -2.5, -2.25)), 
+               aes(x = x, y = y), fill = "white", color = "black", size = 0.5) +  # Home plate
+  scale_fill_gradient2(low = "cornflowerblue", midpoint = 0, high = "firebrick",
+                      limits = c(-5, 5)) +
+  coord_fixed() +
+  facet_wrap(~ handedness) +
+  labs(title = "Slurve") +
+  theme(strip.text = element_text(size = 5, hjust = 0.5),
+        plot.title = element_text(hjust = 0.5, vjust = 3))
+
+```
+
+
+```{r wOBA Proof Zones}
+
+wOBA_P_S_Z <- test_results %>% 
+  filter(description  %in% c("hit_into_play")) %>% 
+  group_by(pitch_type, handedness, zone) %>% 
+  summarize(wOBA = mean(woba_value, na.rm = TRUE)) %>% 
+  mutate(zone = as.factor(zone))
+
+loc_g_woba <- wOBA_P_S_Z %>% 
+  left_join(full_zone_data, join_by(zone)) %>%
+  filter(zone  %in% seq(1, 14, 1)) %>% 
+  filter(pitch_type %in% c("FF", "CH", "CU", "SL"),
+         handedness == "R_R") %>% 
+  mutate(wOBA_val = ifelse(wOBA >= 0.2, wOBA, 0.2))
+
+loc_g_extra_woba <- loc_g_woba %>% 
+  filter(pitch_type %in% c("FF", "CH", "CU", "SL"),
+         handedness == "R_R") %>% 
+  filter(zone %in% 11:14) %>% 
+  mutate(x = ifelse(x > 0, x + 0.5, x - 0.5),
+         y = ifelse(y > 0, y + 0.5, y - 0.5))
+
+
+
+ggplot() +
+  geom_rect(data = loc_g_woba %>% filter(zone  %in% 11:14),
+            aes(xmin = x - 0.75, xmax = x + 0.75, ymin = y - 0.75, ymax = y + 0.75,
+                fill = wOBA_val), color = "black", size = 0.5, show.legend = FALSE) +
+  geom_text(data = loc_g_extra_woba,
+            aes(x = x, y = y, label = round(wOBA, 3)),
+            color = "black", size = 1.75, show.legend = FALSE) +
+  geom_tile(data = loc_g_woba %>% filter(zone %in% 1:9),
+            aes(x = x, y = y, fill = wOBA),
+            color = "black", size = 0.25, show.legend = FALSE) +
+  geom_text(data = loc_g_woba %>% filter(zone %in% 1:9),
+            aes(x = x, y = y, label = round(wOBA, 3)),
+            color = "black", size = 2, show.legend = FALSE) +
+  theme_void() +  # Remove axis and background
+  geom_polygon(data = data.frame(x = c(-0.708, 0.7083, 0.7083, 0, -0.7083),
+                                 y = c(-2, -2, -2.25, -2.5, -2.25)), 
+               aes(x = x, y = y), fill = "white", color = "black", size = 0.5) +  # Home plate
+  scale_fill_gradient2(low = "cornflowerblue", midpoint = 0.406, high = "firebrick",
+                      limits = c(0.2, 0.610)) +
+  coord_fixed() +
+  facet_wrap(~ pitch_type,
+             ncol = 2) +
+  theme(strip.text = element_text(size = 10, hjust = 0.5))
+
+
+```
+
+```{r}
+finding_pitch <- test_results %>% 
+  filter(zone == 8, pitch_type == "FF",
+         stand == "R", p_throws == "R") %>% 
+  filter(description == "foul" | events  %in%  c("double", "triple", "home_run")) %>% 
+  arrange(desc(batter), desc(pitcher))
+
+finding_pitch %>% 
+  filter(player_name == "Flexen, Chris", batter == "667670") %>% View
+
+test_results
+```
+
+
+```{r}
+# VIPs
+
+# Fouls
+vip(runs_model_foul,
+    geom = "col",
+    importance = "impurity",
+    aesthetics = list(color = "white", fill = "#73000A")) + 
+  labs(title = "Variable Importance for Foul Ball Model") +
+       theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+
+# Swing
+vip(runs_model_swing,
+    geom = "col",
+    importance = "impurity",
+    aesthetics = list(color = "white", fill = "#73000A")) + 
+  labs(title = "Variable Importance for Non-Foul Swings Model") +
+       theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+
+# Take
+vip(runs_model_take,
+    geom = "col",
+    importance = "impurity",
+    aesthetics = list(color = "white", fill = "#73000A")) + 
+  labs(title = "Variable Importance for Take Model") +
+       theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+```{r}
+
+test_results %>% 
+  ggplot(aes(x = F_Runs, y = delta_run_exp)) +
+  geom_point(alpha = 0.1, size = 0.15,
+             color = "#73000A") +
+  geom_smooth(se = FALSE, color = "#B59A57") +
+  geom_hline(yintercept = 0, color = "skyblue", linetype = 2, size = 0.5) +
+  labs(x = "Modeled F Runs",
+       y = "Observed Change in Run Expectancy",
+       title = "F Runs vs. Change in Run Expectancy") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+
+```
+

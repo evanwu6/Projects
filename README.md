@@ -1,5 +1,3 @@
-README for Evan Wu's Code Repository:
-
 This is a coding repository for projects that I have completed. Each folder is a different project, which were done for Elon University's baseball team, Elon's Baseball Analytics Club, the SABR Diamond Dollars Case Competition, or the Carnegie Mellon Sports Analytics Camp.
 
 

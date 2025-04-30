@@ -24,6 +24,11 @@ Elon Baseball Pitching Reports:
 Post-game pitching reports for the players and coaches of Elon University's D1 Baseball team. Uses R to output pdfs with pitch movement and metric plots and a variety of performance statistics including hard hit balls and xwOBA.
 
 
+Elon Baseball Hitter Reports:
+
+Seasonal hitting reports reports for the players and coaches of Elon University's D1 Baseball team. Uses R to output pdfs with spray charts, heat maps, and swing decisions evaluations for hitters (based on pitcher handedness and pitch type).
+
+
 Elon Baseball Training Camp Reports:
 
 Pitching reports for Elon Baseball's training camps for younger players. Uses R to create pdfs with pitch movement and metric information, as well as display each pitch's data.

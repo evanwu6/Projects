@@ -14,6 +14,8 @@ Comp App:
 
 This comparison app was meant to be used for "Player A vs. Player B" questions. Lots of job questions and thought exercises give player archetypes and statistics and ask you to determine which you would prefer. This app uses random forest models to predict output based on the input values (meant to highlight the interaction between variables as well). It also can intake a variety of advanced statistics and provides comparable performances from recent seasons.
 
+Link: https://evanwu.shinyapps.io/Comps/
+
 
 
 Diamond Dollars 2024:

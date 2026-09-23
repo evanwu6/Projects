@@ -1,6 +1,8 @@
 This is a coding repository for projects that I have completed. Each folder is a different project, which were done for Elon University's baseball team, Elon's Baseball Analytics Club, the SABR Diamond Dollars Case Competition, the Carnegie Mellon Sports Analytics Camp, or my baseball blog.
 
 
+Under-Graduate Research Repo: https://github.com/evanwu6/Research
+
 OVERVIEW OF PROJECTS:
 
 
